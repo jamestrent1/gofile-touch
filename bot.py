@@ -50,6 +50,12 @@ GOFILE_DOWNLOAD_RE = re.compile(
     r"https://[A-Za-z0-9\-]+\.gofile\.io/download/[^\s\"'<>]+"
 )
 
+# gofile.io generates thumbnail files alongside every media file; their names
+# always start with "thumb_".  We never want to surface these to the user.
+def _is_thumbnail(name: str) -> bool:
+    """Return True if the filename is a gofile.io auto-generated thumbnail."""
+    return name.lower().startswith("thumb_")
+
 # gofile.io website token embedded in their JS bundle (required for API calls).
 # Override via GOFILE_WEBSITE_TOKEN if the default token stops working.
 _GOFILE_WEBSITE_TOKEN: str = os.environ.get("GOFILE_WEBSITE_TOKEN", "4fd6sg89d7s6")
@@ -117,15 +123,41 @@ def _ensure_auth() -> None:
 
 
 def _get_account_token() -> "str | None":
-    """Extract the gofile.io account token from the browser's localStorage."""
+    """Extract the gofile.io account token from the browser's storage or cookies.
+
+    gofile.io may store the token under different keys depending on the app
+    version.  We try localStorage first (multiple known key names), then
+    sessionStorage, then browser cookies.
+    """
     driver = _get_driver()
+    # --- localStorage / sessionStorage ---
     try:
-        token = driver.execute_script("return localStorage.getItem('accountToken')")
+        token = driver.execute_script(
+            """
+            const keys = ['accountToken', 'token', 'userToken', 'account'];
+            for (const k of keys) {
+                const v = localStorage.getItem(k) || sessionStorage.getItem(k);
+                if (v && v.length > 8) return v;
+            }
+            return null;
+            """
+        )
         if token:
-            logger.info("Account token extracted from localStorage.")
+            logger.info("Account token extracted from browser storage.")
             return str(token)
     except Exception as exc:
-        logger.debug("localStorage access failed: %s", exc)
+        logger.debug("Browser storage access failed: %s", exc)
+    # --- cookies ---
+    try:
+        for cookie in driver.get_cookies():
+            if cookie.get("name") in ("accountToken", "token"):
+                value = cookie.get("value", "")
+                if len(value) > 8:
+                    logger.info("Account token extracted from browser cookie.")
+                    return value
+    except Exception as exc:
+        logger.debug("Cookie access failed: %s", exc)
+    logger.info("No account token found; skipping API scrape.")
     return None
 
 
@@ -163,7 +195,6 @@ def _scrape_via_api(folder_id: str) -> "list[dict]":
     """Use the gofile.io REST API to list folder contents (preferred method)."""
     token = _get_account_token()
     if not token:
-        logger.info("No account token available; skipping API scrape.")
         return []
 
     wt = _get_website_token()
@@ -189,9 +220,12 @@ def _scrape_via_api(folder_id: str) -> "list[dict]":
     for item in contents.values():
         if item.get("type") != "file":
             continue
+        name = item.get("name", "")
+        if _is_thumbnail(name):
+            continue  # skip auto-generated thumbnail files
         files.append(
             {
-                "name": item.get("name", ""),
+                "name": name,
                 "url": item.get("link") or item.get("directLink", ""),
                 "size": item.get("size"),
                 "md5": item.get("md5"),
@@ -212,28 +246,55 @@ def _scrape_via_dom(url: str) -> "list[dict]":
     files: list[dict] = []
     seen: set = set()
 
-    # Pass 1 – collect <a> tags whose href matches the gofile download URL pattern.
+    def _add(href: str) -> None:
+        """Validate, de-duplicate, and append a download URL (unless a thumbnail)."""
+        href = href.strip()
+        if not href or href in seen:
+            return
+        if not GOFILE_DOWNLOAD_RE.match(href):
+            return
+        name = unquote(href.rstrip("/").split("/")[-1])
+        if _is_thumbnail(name):
+            return
+        seen.add(href)
+        files.append({"name": name, "url": href})
+
+    # Pass 1 – standard <a> elements with a href attribute.
     for element in driver.find_elements(By.TAG_NAME, "a"):
         try:
             href = element.get_attribute("href") or ""
         except Exception:
             continue
-        if GOFILE_DOWNLOAD_RE.match(href) and href not in seen:
-            seen.add(href)
-            files.append({"name": unquote(href.rstrip("/").split("/")[-1]), "url": href})
+        _add(href)
+
+    # Pass 2 – JavaScript querySelectorAll covering href and data-link attributes
+    # on *any* element type.  This catches download buttons, row wrappers, etc.
+    # that are not plain <a> tags (important for non-media files like .rar).
+    try:
+        js_urls: list = driver.execute_script(
+            """
+            const urls = [];
+            const sel = '[href*="/download/"],[data-link*="/download/"]';
+            document.querySelectorAll(sel).forEach(function(el) {
+                const u = el.getAttribute('href') || el.getAttribute('data-link');
+                if (u) urls.push(u);
+            });
+            return urls;
+            """
+        ) or []
+        for href in js_urls:
+            if isinstance(href, str):
+                _add(href)
+    except Exception as exc:
+        logger.debug("JavaScript link extraction failed: %s", exc)
 
     if files:
         return files
 
-    # Pass 2 – regex-scan the raw page source as a fallback.
+    # Pass 3 – regex-scan the raw page source as a final fallback.
     try:
         for raw_url in GOFILE_DOWNLOAD_RE.findall(driver.page_source):
-            clean = raw_url.rstrip("\"'\\")
-            if clean not in seen:
-                seen.add(clean)
-                files.append(
-                    {"name": unquote(clean.rstrip("/").split("/")[-1]), "url": clean}
-                )
+            _add(raw_url.rstrip("\"'\\"))
     except Exception as exc:
         logger.warning("Page-source scan failed: %s", exc)
 
