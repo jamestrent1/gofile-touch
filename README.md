@@ -83,7 +83,7 @@ The bot replies with a list like:
 |---|---|---|
 | `TELEGRAM_TOKEN` | ✅ | Telegram bot token from @BotFather |
 | `GOFILE_LOGIN_URL` | ❌ | Direct-login URL for the gofile.io account (defaults to the bundled URL) |
-| `GOFILE_WEBSITE_TOKEN` | ❌ | gofile.io website token for API calls; update if API auth fails (default: `4fd6sg89d7s6`) |
+| `GOFILE_WEBSITE_TOKEN` | ❌ | Emergency fallback for the gofile.io website token. The bot automatically extracts the live token from the browser after each page load (it rotates every ~4 hours). Only set this if all automatic extraction methods fail. |
 
 ---
 
@@ -91,11 +91,12 @@ The bot replies with a list like:
 
 ```
 bot.py
- ├── _login()              – Opens LOGIN_URL in Firefox, sets session cookies
- ├── _scrape_via_api()     – Calls gofile.io REST API with browser token
- ├── _scrape_via_dom()     – Selenium DOM scrape as API fallback
- ├── scrape_folder()       – Orchestrates auth + extraction + retry logic
- └── handle_message()      – Telegram message handler
+ ├── _login()                  – Opens LOGIN_URL in Firefox, sets session cookies
+ ├── _refresh_website_token()  – Extracts live wt token from browser performance entries
+ ├── _scrape_via_dom()         – Loads folder in browser, refreshes wt, scrapes links
+ ├── _scrape_via_api()         – Calls gofile.io REST API with fresh wt + account token
+ ├── scrape_folder()           – DOM load first (refreshes wt) → API call → DOM fallback
+ └── handle_message()          – Telegram message handler
 ```
 
 ---
@@ -104,6 +105,9 @@ bot.py
 
 * The direct-login URL (`LOGIN_URL` in `bot.py`) is tied to a specific gofile.io
   account. Replace it if you use a different account.
-* The `_GOFILE_WEBSITE_TOKEN` constant (`4fd6sg89d7s6`) is embedded in the
-  gofile.io web bundle and is required by the API. Update it if API calls start
-  returning auth errors.
+* The gofile.io website token (`wt`) rotates roughly every 4 hours and is
+  unique per account. The bot automatically extracts it from the browser's
+  performance resource-timing entries after every page load — no manual
+  configuration is needed. The `GOFILE_WEBSITE_TOKEN` environment variable
+  is an emergency override that is only used if all automatic extraction
+  methods fail.

@@ -56,9 +56,20 @@ def _is_thumbnail(name: str) -> bool:
     """Return True if the filename is a gofile.io auto-generated thumbnail."""
     return name.lower().startswith("thumb_")
 
-# gofile.io website token embedded in their JS bundle (required for API calls).
-# Override via GOFILE_WEBSITE_TOKEN if the default token stops working.
-_GOFILE_WEBSITE_TOKEN: str = os.environ.get("GOFILE_WEBSITE_TOKEN", "4fd6sg89d7s6")
+# Legacy fallback website token (override via GOFILE_WEBSITE_TOKEN env var).
+# NOTE: gofile.io's website token is now dynamic – it rotates roughly every
+# 4 hours and differs per account.  The bot extracts the live token from the
+# browser's performance resource entries after each page navigation, so this
+# constant is only used when all extraction attempts fail.
+_GOFILE_WEBSITE_TOKEN: str = os.environ.get("GOFILE_WEBSITE_TOKEN", "")
+
+# ---------------------------------------------------------------------------
+# Website-token cache (the token rotates ~every 4 h; we refresh every 3.5 h)
+# ---------------------------------------------------------------------------
+
+_cached_wt: str = ""
+_wt_fetched_at: float = 0.0
+_WT_TTL_SECONDS: int = 12600  # 3.5 hours (token rotates every ~4 h)
 
 # How long (seconds) to wait after the login redirect for cookies to be set.
 _LOGIN_WAIT_SECONDS: int = 6
@@ -110,6 +121,8 @@ def _login() -> None:
     time.sleep(_LOGIN_WAIT_SECONDS)
     logger.info("Authentication step completed. Current URL: %s", driver.current_url)
     _authenticated = True
+    # Attempt to grab the website token now that the SPA has initialised.
+    _refresh_website_token()
 
 
 def _ensure_auth() -> None:
@@ -161,19 +174,81 @@ def _get_account_token() -> "str | None":
     return None
 
 
-def _get_website_token() -> str:
-    """Try to read the website token from the page; fall back to the known constant."""
+def _refresh_website_token() -> None:
+    """Try to extract the live gofile.io website token from the current browser page.
+
+    gofile.io's website token (``wt``) rotates roughly every 4 hours and is
+    unique per account.  The most reliable source is the browser's performance
+    resource-timing API: after any gofile.io folder page loads, the SPA has
+    already made its own API call containing ``wt=<token>`` in the URL.  We
+    read it back from ``performance.getEntriesByType('resource')``.
+    """
+    global _cached_wt, _wt_fetched_at
     driver = _get_driver()
+
+    # Method 1: performance resource entries – the SPA's own API calls embed wt=.
+    # We scan from newest to oldest so we get the most recent token.
     try:
         wt = driver.execute_script(
-            "return window._wt "
-            "|| document.querySelector('meta[name=\"wt\"]')?.getAttribute('content')"
+            """
+            try {
+                var entries = performance.getEntriesByType('resource');
+                for (var i = entries.length - 1; i >= 0; i--) {
+                    var name = entries[i].name || '';
+                    if (name.indexOf('api.gofile.io') !== -1) {
+                        var m = name.match(/[?&]wt=([A-Za-z0-9]+)/);
+                        if (m && m[1].length > 4) return m[1];
+                    }
+                }
+            } catch(e) {}
+            return null;
+            """
         )
-        if wt:
-            return str(wt)
-    except Exception:
-        pass
-    return _GOFILE_WEBSITE_TOKEN
+        if wt and len(str(wt)) > 4:
+            _cached_wt = str(wt)
+            _wt_fetched_at = time.time()
+            logger.info("Website token refreshed from performance entries.")
+            return
+    except Exception as exc:
+        logger.debug("Performance-entry wt extraction failed: %s", exc)
+
+    # Method 2: common window properties set by the gofile.io SPA.
+    try:
+        wt = driver.execute_script(
+            "return window._wt || window.wt || window.websiteToken"
+            " || (window.appdata && window.appdata.wt) || null;"
+        )
+        if wt and len(str(wt)) > 4:
+            _cached_wt = str(wt)
+            _wt_fetched_at = time.time()
+            logger.info("Website token refreshed from window property.")
+            return
+    except Exception as exc:
+        logger.debug("Window-property wt extraction failed: %s", exc)
+
+    # Method 3: regex scan of the page source.
+    try:
+        m = re.search(
+            r"""["']wt["']\s*:\s*["']([A-Za-z0-9]{6,})["']""",
+            driver.page_source,
+        )
+        if m:
+            _cached_wt = m.group(1)
+            _wt_fetched_at = time.time()
+            logger.info("Website token refreshed from page source.")
+            return
+    except Exception as exc:
+        logger.debug("Page-source wt scan failed: %s", exc)
+
+    logger.debug("Could not extract website token from browser page.")
+
+
+def _get_website_token() -> str:
+    """Return a valid gofile.io website token, refreshing the cache if stale."""
+    if _cached_wt and (time.time() - _wt_fetched_at) < _WT_TTL_SECONDS:
+        return _cached_wt
+    _refresh_website_token()
+    return _cached_wt or _GOFILE_WEBSITE_TOKEN
 
 
 def _build_requests_session() -> requests.Session:
@@ -246,6 +321,10 @@ def _scrape_via_dom(url: str) -> "list[dict]":
     files: list[dict] = []
     seen: set = set()
 
+    # The SPA has now made its own API calls (which contain wt= in the URL).
+    # Grab the website token from the performance entries while we're here.
+    _refresh_website_token()
+
     def _add(href: str) -> None:
         """Validate, de-duplicate, and append a download URL (unless a thumbnail)."""
         href = href.strip()
@@ -310,25 +389,21 @@ def scrape_folder(folder_url: str) -> "list[dict]":
     match = GOFILE_FOLDER_RE.search(folder_url)
     folder_id = match.group(1) if match else None
 
-    # Preferred path: REST API (structured, reliable).
-    if folder_id:
-        files = _scrape_via_api(folder_id)
-        if files:
-            return files
-
-    # Fallback: Selenium DOM scraping in the authenticated browser.
+    # -----------------------------------------------------------------------
+    # Step 1 – Load the folder page in the authenticated browser.
+    #
+    # This serves two purposes:
+    #   a) The gofile.io SPA makes its own API call (with the live wt= token)
+    #      which we capture via performance.getEntriesByType('resource').
+    #      _refresh_website_token() is called inside _scrape_via_dom() after
+    #      the page renders, so the token cache is up-to-date before Step 2.
+    #   b) The DOM-scraped results are used as a fallback if the API path fails.
+    # -----------------------------------------------------------------------
+    dom_files: list[dict] = []
     try:
-        files = _scrape_via_dom(folder_url)
-        if not files and folder_id:
-            # Session may have expired – re-authenticate once and retry.
-            logger.info("No files found; re-authenticating and retrying…")
-            _authenticated = False
-            _login()
-            files = _scrape_via_dom(folder_url)
-        return files
+        dom_files = _scrape_via_dom(folder_url)
     except WebDriverException as exc:
-        logger.error("WebDriver error during scrape: %s", exc)
-        # Tear down the broken driver so the next call starts fresh.
+        logger.error("WebDriver error during DOM scrape: %s", exc)
         try:
             if _driver:
                 _driver.quit()
@@ -337,6 +412,47 @@ def scrape_folder(folder_url: str) -> "list[dict]":
         _driver = None
         _authenticated = False
         raise
+
+    # -----------------------------------------------------------------------
+    # Step 2 – REST API call (now has a fresh website token from Step 1).
+    # -----------------------------------------------------------------------
+    if folder_id:
+        api_files = _scrape_via_api(folder_id)
+        if api_files:
+            return api_files
+
+    # -----------------------------------------------------------------------
+    # Step 3 – Fall back to DOM results.
+    # -----------------------------------------------------------------------
+    if dom_files:
+        return dom_files
+
+    # -----------------------------------------------------------------------
+    # Step 4 – Nothing found at all; session may have expired.
+    #           Re-authenticate once and retry the full sequence.
+    # -----------------------------------------------------------------------
+    if folder_id:
+        logger.info("No files found; re-authenticating and retrying…")
+        _authenticated = False
+        _login()
+        try:
+            dom_files = _scrape_via_dom(folder_url)
+        except WebDriverException as exc:
+            logger.error("WebDriver error during retry DOM scrape: %s", exc)
+            try:
+                if _driver:
+                    _driver.quit()
+            except Exception:
+                pass
+            _driver = None
+            _authenticated = False
+            raise
+        api_files = _scrape_via_api(folder_id)
+        if api_files:
+            return api_files
+        return dom_files
+
+    return dom_files
 
 
 # ---------------------------------------------------------------------------
