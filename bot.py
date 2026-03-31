@@ -150,7 +150,9 @@ def _build_requests_session() -> requests.Session:
     session = requests.Session()
     try:
         for cookie in driver.get_cookies():
-            if "gofile.io" in cookie.get("domain", ""):
+            domain = cookie.get("domain", "")
+            # Only transfer cookies whose domain is exactly gofile.io or a subdomain of it.
+            if domain == "gofile.io" or domain.endswith(".gofile.io"):
                 session.cookies.set(cookie["name"], cookie["value"])
     except Exception as exc:
         logger.debug("Could not transfer browser cookies: %s", exc)
@@ -210,13 +212,13 @@ def _scrape_via_dom(url: str) -> "list[dict]":
     files: list[dict] = []
     seen: set = set()
 
-    # Pass 1 – collect <a> tags whose href contains a gofile download path.
+    # Pass 1 – collect <a> tags whose href matches the gofile download URL pattern.
     for element in driver.find_elements(By.TAG_NAME, "a"):
         try:
             href = element.get_attribute("href") or ""
         except Exception:
             continue
-        if ".gofile.io/download" in href and href not in seen:
+        if GOFILE_DOWNLOAD_RE.match(href) and href not in seen:
             seen.add(href)
             files.append({"name": unquote(href.rstrip("/").split("/")[-1]), "url": href})
 
