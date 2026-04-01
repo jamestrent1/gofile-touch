@@ -8,14 +8,15 @@ file names and direct download links inside any gofile.io folder you share.
 ## Features
 
 * Logs in to your gofile.io account automatically before browsing any folder.
-* Extracts file links using four passes (fastest/most reliable tried first):
-  1. **Anchor tags** – standard `<a href="...">` elements for single-file folders.
-  2. **Broad attribute scan** – checks every element's `href`, `data-link`,
-     `data-url`, `data-href`, and `data-download` attributes for gofile.io URLs.
-  3. **React fiber extraction** – walks the React component tree to read the
-     full file list directly from the SPA's JavaScript state (the most reliable
-     path for multi-file / non-media folders).
-  4. **Page-source regex** – last-resort scan of the raw rendered HTML.
+* **Primary extraction: gofile.io JSON API** – calls `api.gofile.io/contents/{id}`
+  directly.  Works reliably for all file types (`.rar`, `.zip`, `.mkv`, multi-file
+  folders, etc.) because the API always returns the full file list with download
+  links, regardless of whether the file is a media type or not.
+* **Fallback: DOM scraping** – loads the folder page in Firefox and extracts links
+  using four passes (anchor tags → broad attribute scan → JavaScript state → page
+  source regex).  Used only when the API returns nothing.
+* `/debug <url>` command – sends a full diagnostic `.txt` report including the raw
+  API JSON response, so any future issues can be diagnosed precisely.
 * Automatically re-authenticates if the session expires.
 * Returns file name, download URL, size, and MD5 (when available) for every
   file in the folder.
@@ -78,6 +79,9 @@ The bot replies with a list like:
 …
 ```
 
+Use `/debug https://gofile.io/d/xxxxx` to get a full diagnostic report as a
+`.txt` file when something isn't working.
+
 ---
 
 ## Environment variables
@@ -86,6 +90,7 @@ The bot replies with a list like:
 |---|---|---|
 | `TELEGRAM_TOKEN` | ✅ | Telegram bot token from @BotFather |
 | `GOFILE_LOGIN_URL` | ❌ | Direct-login URL for the gofile.io account (defaults to the bundled URL) |
+| `GOFILE_WEBSITE_TOKEN` | ❌ | Website token used as the `wt` parameter in API requests (default: `4fd6sg89d7s6`). Update if gofile.io rotates it. |
 
 ---
 
@@ -93,14 +98,18 @@ The bot replies with a list like:
 
 ```
 bot.py
- ├── _login()          – Opens LOGIN_URL in Firefox, sets session cookies
- ├── _scrape_via_dom() – Loads folder in browser; 4-pass extraction:
+ ├── _login()           – Opens LOGIN_URL in Firefox, sets session cookies
+ ├── _get_api_token()   – Reads account token from browser localStorage,
+ │                        or creates a guest token via POST /accounts
+ ├── _scrape_via_api()  – PRIMARY: GET api.gofile.io/contents/{id}
+ │                        → returns all files for any file type / folder size
+ ├── _scrape_via_dom()  – FALLBACK: loads folder in browser; 4-pass extraction:
  │    ├── Pass 1: <a href> anchor tags
  │    ├── Pass 2: broad JS attribute scan (data-link, data-url, …)
- │    ├── Pass 3: React fiber state traversal (multi-file / non-media)
+ │    ├── Pass 3: JavaScript state traversal
  │    └── Pass 4: page-source regex fallback
- ├── scrape_folder()   – DOM scrape → if empty, re-auth → DOM retry
- └── handle_message()  – Telegram message handler
+ ├── scrape_folder()    – API → if empty, DOM → if empty, re-auth → API+DOM retry
+ └── handle_message()   – Telegram message handler
 ```
 
 ---
@@ -109,3 +118,6 @@ bot.py
 
 * The direct-login URL (`LOGIN_URL` in `bot.py`) is tied to a specific gofile.io
   account. Replace it (or set `GOFILE_LOGIN_URL`) if you use a different account.
+* The website token (`wt=4fd6sg89d7s6`) is gofile.io's public web-app token
+  embedded in their JavaScript bundle.  If it ever changes, set the
+  `GOFILE_WEBSITE_TOKEN` environment variable to the new value.

@@ -16,6 +16,7 @@ import re
 import time
 from urllib.parse import unquote, urlparse
 
+import requests as _requests
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.firefox.options import Options
@@ -51,6 +52,11 @@ GOFILE_DOWNLOAD_RE = re.compile(
     r"https://[A-Za-z0-9\-]+\.gofile\.io/download/[^\s\"'<>]+"
 )
 
+# Website token embedded in gofile.io's JavaScript bundle.
+# Used as the `wt` query parameter for all API requests.
+# Override via GOFILE_WEBSITE_TOKEN env var if gofile.io ever rotates it.
+GOFILE_WEBSITE_TOKEN: str = os.environ.get("GOFILE_WEBSITE_TOKEN", "4fd6sg89d7s6")
+
 # gofile.io generates thumbnail files alongside every media file; their names
 # always start with "thumb_".  We never want to surface these to the user.
 def _is_thumbnail(name: str) -> bool:
@@ -83,6 +89,10 @@ _MAX_FIBER_DEPTH: int = 150
 
 _driver: "webdriver.Firefox | None" = None
 _authenticated: bool = False
+
+# Cached guest API token (reused across calls to avoid creating many accounts).
+_guest_api_token: str = ""
+
 
 
 def _build_driver() -> webdriver.Firefox:
@@ -124,6 +134,101 @@ def _ensure_auth() -> None:
 # ---------------------------------------------------------------------------
 # File-extraction helpers
 # ---------------------------------------------------------------------------
+
+
+def _get_api_token() -> str:
+    """Return a valid gofile.io API token.
+
+    Prefers the real account token extracted from the authenticated browser
+    session's localStorage (so private/account-owned content is accessible).
+    Falls back to creating a fresh guest account token via the public API.
+    The guest token is cached globally to avoid creating many accounts.
+    """
+    global _guest_api_token
+
+    # Prefer the real account token from the already-authenticated browser.
+    if _authenticated:
+        try:
+            driver = _get_driver()
+            acct_token = driver.execute_script(
+                "return localStorage.getItem('accountToken')"
+                " || localStorage.getItem('token')"
+                " || localStorage.getItem('auth_token');"
+            )
+            if acct_token and str(acct_token).strip():
+                return str(acct_token).strip()
+        except Exception as exc:
+            logger.debug("Could not read token from browser localStorage: %s", exc)
+
+    # Reuse a cached guest token to avoid creating many accounts.
+    if _guest_api_token:
+        return _guest_api_token
+
+    resp = _requests.post("https://api.gofile.io/accounts", timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("status") != "ok":
+        raise RuntimeError(
+            f"gofile.io /accounts returned status={data.get('status')!r}"
+        )
+    _guest_api_token = data["data"]["token"]
+    logger.info("Created gofile.io guest API token.")
+    return _guest_api_token
+
+
+def _scrape_via_api(folder_url: str) -> "list[dict]":
+    """Fetch folder contents via the gofile.io JSON API.
+
+    This is the primary and most reliable extraction method.  The API returns
+    full metadata (name, link, size, md5) for **all** file types and folder
+    sizes.  The DOM/page-source approach only works for single media files
+    because gofile.io embeds the URL in a video player; for .rar archives,
+    zip files, and multi-file folders the download URL is never written into
+    the HTML — it is only loaded on-demand via JavaScript.
+    """
+    match = GOFILE_FOLDER_RE.search(folder_url)
+    if not match:
+        return []
+    folder_id = match.group(1)
+
+    token = _get_api_token()
+    api_url = (
+        f"https://api.gofile.io/contents/{folder_id}"
+        f"?wt={GOFILE_WEBSITE_TOKEN}&cache=true"
+    )
+    resp = _requests.get(
+        api_url,
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=20,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+
+    if data.get("status") != "ok":
+        logger.warning(
+            "gofile.io API returned status=%r for %s", data.get("status"), folder_url
+        )
+        return []
+
+    children = data.get("data", {}).get("children", {})
+    files: list[dict] = []
+    for item in children.values():
+        if item.get("type") != "file":
+            continue
+        name = item.get("name", "")
+        link = item.get("link") or item.get("directLink") or ""
+        if not link or _is_thumbnail(name):
+            continue
+        files.append(
+            {
+                "name": name,
+                "url": link,
+                "size": item.get("size"),
+                "md5": item.get("md5"),
+            }
+        )
+    logger.info("API extracted %d file(s) from %s.", len(files), folder_url)
+    return files
 
 
 def _scrape_via_dom(url: str) -> "list[dict]":
@@ -299,9 +404,25 @@ def scrape_folder(folder_url: str) -> "list[dict]":
     _ensure_auth()
 
     # -----------------------------------------------------------------------
-    # Step 1 – Load the folder page in the authenticated browser and scrape.
+    # Step 1 – gofile.io JSON API (primary method).
+    #
+    # The API is reliable for all file types: single files, multi-file folders,
+    # .rar/.zip archives, etc.  The DOM/page-source approach only works for
+    # single media files (video player embeds the URL in the HTML); for all
+    # other types the download URL is never placed in the page source.
     # -----------------------------------------------------------------------
-    files: list[dict] = []
+    try:
+        files = _scrape_via_api(folder_url)
+        if files:
+            return files
+        logger.info("API returned no files for %s; falling back to DOM.", folder_url)
+    except Exception as exc:
+        logger.warning("API scrape failed (%s); falling back to DOM.", exc)
+
+    # -----------------------------------------------------------------------
+    # Step 2 – DOM scraping fallback (handles edge cases, new URL patterns).
+    # -----------------------------------------------------------------------
+    files = []
     try:
         files = _scrape_via_dom(folder_url)
     except WebDriverException as exc:
@@ -319,12 +440,20 @@ def scrape_folder(folder_url: str) -> "list[dict]":
         return files
 
     # -----------------------------------------------------------------------
-    # Step 2 – Nothing found; session may have expired.
-    #           Re-authenticate once and retry DOM scraping.
+    # Step 3 – Nothing found; session may have expired.
+    #           Re-authenticate once and retry API + DOM.
     # -----------------------------------------------------------------------
     logger.info("No files found; re-authenticating and retrying…")
     _authenticated = False
     _login()
+
+    try:
+        files = _scrape_via_api(folder_url)
+        if files:
+            return files
+    except Exception as exc:
+        logger.warning("API retry failed: %s", exc)
+
     try:
         files = _scrape_via_dom(folder_url)
     except WebDriverException as exc:
@@ -583,6 +712,38 @@ def _scrape_debug_report(url: str) -> str:
     lines.append(f"Unique URLs: {len(all_gofile_urls)}")
     for i, u in enumerate(all_gofile_urls, 1):
         lines.append(f"  [{i:03d}] {u}")
+    lines.append("")
+
+    # -------------------------------------------------------------------
+    # API – direct gofile.io JSON API call (the primary fix path)
+    # -------------------------------------------------------------------
+    lines.append("=== API: gofile.io /contents/{id} JSON response ===")
+    match = GOFILE_FOLDER_RE.search(url)
+    if match:
+        folder_id = match.group(1)
+        try:
+            token = _get_api_token()
+            lines.append(f"Token used (first 8 chars): {token[:8]}…")
+            api_url = (
+                f"https://api.gofile.io/contents/{folder_id}"
+                f"?wt={GOFILE_WEBSITE_TOKEN}&cache=true"
+            )
+            lines.append(f"API URL: {api_url}")
+            resp = _requests.get(
+                api_url,
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=20,
+            )
+            lines.append(f"HTTP status: {resp.status_code}")
+            try:
+                api_data = resp.json()
+                lines.append(json.dumps(api_data, indent=2, default=str))
+            except Exception:
+                lines.append(f"RAW BODY: {resp.text[:3000]}")
+        except Exception as exc:
+            lines.append(f"ERROR: {exc}")
+    else:
+        lines.append("(Could not extract folder ID from URL)")
     lines.append("")
 
     lines.append("=== END OF REPORT ===")
