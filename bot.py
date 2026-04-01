@@ -135,6 +135,59 @@ def _pick_server(servers_str: str) -> str:
     return parts[0] if parts else ""
 
 
+def _close_modal(driver: webdriver.Firefox) -> None:
+    """Close any open Properties modal by clicking its × close button.
+
+    Tries four strategies via a single JavaScript call (avoids Selenium
+    stale-element issues), then falls back to the Escape key.
+    """
+    try:
+        clicked = driver.execute_script(
+            """
+            // Strategy 1 – button with aria-label containing "close"
+            var btns = document.querySelectorAll('button[aria-label]');
+            for (var i = 0; i < btns.length; i++) {
+                var lbl = (btns[i].getAttribute('aria-label') || '').toLowerCase();
+                if (lbl.indexOf('close') !== -1 && btns[i].offsetParent !== null) {
+                    btns[i].click(); return true;
+                }
+            }
+            // Strategy 2 – button whose visible text is a common close symbol
+            var symbols = ['\u00d7', '\u2715', '\u2716', '\u2573', '\u2613'];
+            btns = document.querySelectorAll('button');
+            for (var i = 0; i < btns.length; i++) {
+                var t = (btns[i].textContent || '').trim();
+                if (symbols.indexOf(t) !== -1 && btns[i].offsetParent !== null) {
+                    btns[i].click(); return true;
+                }
+            }
+            // Strategy 3 – first button inside role="dialog" (usually the header ×)
+            var dialog = document.querySelector('[role="dialog"]');
+            if (dialog) {
+                var dbtns = dialog.querySelectorAll('button');
+                if (dbtns.length > 0) { dbtns[0].click(); return true; }
+            }
+            // Strategy 4 – button with a CSS class containing "close"
+            var cb = document.querySelector(
+                'button[class*="close"], [class*="modal"] button[class*="close"]'
+            );
+            if (cb && cb.offsetParent !== null) { cb.click(); return true; }
+            return false;
+            """
+        )
+        if clicked:
+            time.sleep(0.4)
+            return
+    except Exception:
+        pass
+    # Fallback: Escape key (works for dropdowns and some modals)
+    try:
+        driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
+    except Exception:
+        pass
+    time.sleep(0.3)
+
+
 def _scrape_via_properties(url: str) -> "list[dict]":
     """Navigate to a gofile.io folder and scrape files via the Properties dialog.
 
@@ -242,8 +295,7 @@ def _scrape_via_properties(url: str) -> "list[dict]":
 
             if not id_m:
                 logger.warning("Could not extract file ID for %r", fname)
-                driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
-                time.sleep(0.3)
+                _close_modal(driver)
                 continue
 
             file_id = id_m.group(1)
@@ -255,8 +307,7 @@ def _scrape_via_properties(url: str) -> "list[dict]":
                     fname,
                     srv_m.group(1) if srv_m else "",
                 )
-                driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
-                time.sleep(0.3)
+                _close_modal(driver)
                 continue
 
             download_url = (
@@ -268,12 +319,8 @@ def _scrape_via_properties(url: str) -> "list[dict]":
         except Exception as exc:
             logger.warning("Error scraping properties for %r: %s", fname, exc)
         finally:
-            # Always try to dismiss any open modal or dropdown before continuing.
-            try:
-                driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
-                time.sleep(0.2)
-            except Exception:
-                pass
+            # Always try to close any open modal or dropdown before continuing.
+            _close_modal(driver)
 
     return files
 
@@ -550,11 +597,7 @@ def _scrape_debug_report(url: str) -> str:
         except Exception as exc:
             lines.append(f"  EXCEPTION: {exc}")
         finally:
-            try:
-                driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
-                time.sleep(0.2)
-            except Exception:
-                pass
+            _close_modal(driver)
 
     lines.append("")
     lines.append("=== END OF REPORT ===")
