@@ -8,6 +8,8 @@ The bot authenticates to a gofile.io account before scraping any folder link,
 ensuring that private or account-protected content is accessible.
 """
 
+import io
+import json
 import logging
 import os
 import re
@@ -19,7 +21,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.firefox.options import Options
 from selenium.common.exceptions import WebDriverException
 from telegram import Update
-from telegram.ext import Application, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -403,8 +405,239 @@ async def _send_reply(
 
 
 # ---------------------------------------------------------------------------
+# Debug-report helper
+# ---------------------------------------------------------------------------
+
+
+def _scrape_debug_report(url: str) -> str:
+    """Run a full instrumented scrape and return a detailed plain-text report.
+
+    Captures: auth state, page source, all <a> hrefs, every element with a
+    gofile.io attribute (Pass 2), the raw React fiber output (Pass 3 without
+    filtering), all GOFILE_DOWNLOAD_RE regex matches (Pass 4), and every
+    gofile.io URL found anywhere in the rendered page source.
+    """
+    lines: list[str] = []
+    ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    lines.append("=== gofile-touch DEBUG REPORT ===")
+    lines.append(f"Generated : {ts}")
+    lines.append(f"URL       : {url}")
+    lines.append("")
+
+    _ensure_auth()
+    driver = _get_driver()
+
+    lines.append(f"[AUTH] _authenticated = {_authenticated}")
+    lines.append(f"[AUTH] Browser URL before load: {driver.current_url}")
+    lines.append("")
+
+    lines.append(f"[LOAD] Navigating to: {url}")
+    driver.get(url)
+    lines.append(f"[LOAD] Waiting {_PAGE_RENDER_WAIT_SECONDS}s for SPA render …")
+    time.sleep(_PAGE_RENDER_WAIT_SECONDS)
+    lines.append(f"[LOAD] Final URL : {driver.current_url}")
+    lines.append(f"[LOAD] Page title: {driver.title!r}")
+    lines.append("")
+
+    # -------------------------------------------------------------------
+    # Page source
+    # -------------------------------------------------------------------
+    page_source: str = driver.page_source or ""
+    lines.append(f"[PAGE_SOURCE] Total length: {len(page_source)} chars")
+    lines.append("[PAGE_SOURCE] ── first 3000 chars ──")
+    lines.append(page_source[:3000])
+    lines.append("[PAGE_SOURCE] ── last 1000 chars ──")
+    lines.append(page_source[-1000:])
+    lines.append("")
+
+    # -------------------------------------------------------------------
+    # Pass 1 – all <a> tags
+    # -------------------------------------------------------------------
+    lines.append("=== PASS 1: all <a href> elements ===")
+    a_tags: list[tuple[str, str]] = []
+    for element in driver.find_elements(By.TAG_NAME, "a"):
+        try:
+            href = element.get_attribute("href") or ""
+            text = (element.text or "").replace("\n", " ")[:120]
+            a_tags.append((href, text))
+        except Exception as exc:
+            a_tags.append((f"ERROR:{exc}", ""))
+    lines.append(f"Total <a> elements: {len(a_tags)}")
+    for i, (href, text) in enumerate(a_tags, 1):
+        lines.append(f"  [{i:03d}] href={href!r}  text={text!r}")
+    lines.append("")
+
+    # -------------------------------------------------------------------
+    # Pass 2 – JS attribute scan (broad – all gofile.io, not just /download/)
+    # -------------------------------------------------------------------
+    lines.append("=== PASS 2: JS broad attribute scan (all gofile.io) ===")
+    try:
+        js_items: list = driver.execute_script(
+            """
+            const results = [];
+            const attrs = ['href', 'data-link', 'data-url', 'data-href', 'data-download'];
+            document.querySelectorAll('*').forEach(function(el) {
+                attrs.forEach(function(attr) {
+                    const u = el.getAttribute(attr);
+                    if (u && u.indexOf('gofile.io') !== -1) {
+                        results.push([
+                            attr,
+                            u,
+                            el.tagName,
+                            el.className,
+                            el.textContent.trim().slice(0, 200)
+                        ]);
+                    }
+                });
+            });
+            return results;
+            """
+        ) or []
+        lines.append(f"Total matches: {len(js_items)}")
+        for i, item in enumerate(js_items, 1):
+            attr, u, tag, cls, text = (list(item) + ["", "", "", "", ""])[:5]
+            lines.append(
+                f"  [{i:03d}] attr={attr!r}  url={u!r}  "
+                f"tag={tag!r}  class={str(cls)[:60]!r}  text={str(text)[:80]!r}"
+            )
+    except Exception as exc:
+        lines.append(f"ERROR: {exc}")
+    lines.append("")
+
+    # -------------------------------------------------------------------
+    # Pass 3 – React fiber (raw, unfiltered – shows all keys present)
+    # -------------------------------------------------------------------
+    lines.append("=== PASS 3: React fiber raw extraction ===")
+    try:
+        fiber_raw = driver.execute_script(
+            f"""
+            try {{
+                function findContents(fiber, depth) {{
+                    if (!fiber || depth > {_MAX_FIBER_DEPTH}) return null;
+                    for (var s = fiber.memoizedState; s; s = s.next) {{
+                        var v = s.memoizedState;
+                        if (v && typeof v === 'object' && !Array.isArray(v)) {{
+                            var contents = null;
+                            if (v.contents && typeof v.contents === 'object')
+                                contents = v.contents;
+                            else if (v.data && v.data.contents)
+                                contents = v.data.contents;
+                            else if (v.status === 'ok' && v.data && v.data.contents)
+                                contents = v.data.contents;
+                            if (contents) {{
+                                return Object.values(contents).map(function(i) {{
+                                    if (!i || typeof i !== 'object') return {{raw: String(i)}};
+                                    var out = {{}};
+                                    Object.keys(i).forEach(function(k) {{
+                                        var val = i[k];
+                                        out[k] = (typeof val === 'object' && val !== null)
+                                            ? '[object]' : val;
+                                    }});
+                                    return out;
+                                }});
+                            }}
+                        }}
+                    }}
+                    return findContents(fiber.child, depth + 1)
+                        || findContents(fiber.sibling, depth + 1);
+                }}
+                var root = document.getElementById('root') || document.body;
+                var key = Object.keys(root).find(function(k) {{
+                    return k.indexOf('__reactFiber') === 0
+                        || k.indexOf('__reactInternalInstance') === 0;
+                }});
+                if (!key) return {{
+                    error: 'No React fiber key found on root element',
+                    rootKeys: Object.keys(root).slice(0, 30)
+                }};
+                var result = findContents(root[key], 0);
+                if (!result) return {{error: 'findContents returned null – fiber walked but no contents object found'}};
+                return result;
+            }} catch(e) {{
+                return {{error: e.toString(), stack: e.stack || ''}};
+            }}
+            """
+        )
+        lines.append(json.dumps(fiber_raw, indent=2, default=str))
+    except Exception as exc:
+        lines.append(f"ERROR: {exc}")
+    lines.append("")
+
+    # -------------------------------------------------------------------
+    # Pass 4 – regex on page source
+    # -------------------------------------------------------------------
+    lines.append("=== PASS 4: GOFILE_DOWNLOAD_RE regex matches ===")
+    re_matches = GOFILE_DOWNLOAD_RE.findall(page_source)
+    lines.append(f"Matches: {len(re_matches)}")
+    for i, m in enumerate(re_matches, 1):
+        lines.append(f"  [{i:03d}] {m}")
+    lines.append("")
+
+    # -------------------------------------------------------------------
+    # Bonus – every gofile.io URL anywhere in the page source
+    # -------------------------------------------------------------------
+    lines.append("=== BONUS: all gofile.io URLs in page source ===")
+    any_gofile_re = re.compile(r"https?://[^\s\"'<>]*gofile\.io[^\s\"'<>]*")
+    all_gofile_urls = sorted(set(any_gofile_re.findall(page_source)))
+    lines.append(f"Unique URLs: {len(all_gofile_urls)}")
+    for i, u in enumerate(all_gofile_urls, 1):
+        lines.append(f"  [{i:03d}] {u}")
+    lines.append("")
+
+    lines.append("=== END OF REPORT ===")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Telegram message handler
 # ---------------------------------------------------------------------------
+
+
+async def handle_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /debug <url> – run a full diagnostic scrape and reply with a .txt report."""
+    if not update.message:
+        return
+
+    raw_text = update.message.text or ""
+    # Extract the URL from the command arguments.
+    parts = raw_text.split(None, 1)
+    if len(parts) < 2 or not parts[1].strip():
+        await update.message.reply_text(
+            "Usage: /debug <gofile.io/d/xxxxx>\n"
+            "Example: /debug https://gofile.io/d/abc123"
+        )
+        return
+
+    url_text = parts[1].strip()
+    match = GOFILE_FOLDER_RE.search(url_text)
+    if not match:
+        await update.message.reply_text(
+            "❌ No valid gofile.io folder URL found.\n"
+            "Expected format: https://gofile.io/d/xxxxxx"
+        )
+        return
+
+    folder_url = match.group(0)
+    status_msg = await update.message.reply_text(
+        f"🔍 Running debug scan on {folder_url} …\n"
+        "This may take ~15 seconds."
+    )
+
+    try:
+        report = _scrape_debug_report(folder_url)
+    except Exception as exc:
+        logger.exception("Debug scrape failed for %s", folder_url)
+        await status_msg.edit_text(f"❌ Debug scrape error: {str(exc)[:300]}")
+        return
+
+    report_bytes = report.encode("utf-8", errors="replace")
+    await status_msg.edit_text("✅ Debug report ready – sending as file…")
+    await update.message.reply_document(
+        document=io.BytesIO(report_bytes),
+        filename="gofile_debug.txt",
+        caption=f"Debug report for {folder_url}",
+    )
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -451,6 +684,7 @@ def main() -> None:
     _login()
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler("debug", handle_debug))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("Bot is polling for messages.")
