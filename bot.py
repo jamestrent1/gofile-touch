@@ -6,19 +6,21 @@ Environment variables required:
 
 The bot authenticates to a gofile.io account before scraping any folder link,
 ensuring that private or account-protected content is accessible.
+
+Download URL construction: for each file the bot opens the 3-dot action menu,
+clicks Properties, and reads the file ID and server list from the dialog to
+build:  https://{server}.gofile.io/download/web/{file_id}/{filename}
 """
 
 import io
-import json
 import logging
 import os
 import re
 import time
-from urllib.parse import unquote, urlparse
 
-import requests as _requests
 from selenium import webdriver
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.firefox.options import Options
 from selenium.common.exceptions import WebDriverException
 from telegram import Update
@@ -48,14 +50,6 @@ LOGIN_URL: str = os.environ.get(
 )
 
 GOFILE_FOLDER_RE = re.compile(r"https?://(?:www\.)?gofile\.io/d/(\w+)")
-GOFILE_DOWNLOAD_RE = re.compile(
-    r"https://[A-Za-z0-9\-]+\.gofile\.io/download/[^\s\"'<>]+"
-)
-
-# Website token embedded in gofile.io's JavaScript bundle.
-# Used as the `wt` query parameter for all API requests.
-# Override via GOFILE_WEBSITE_TOKEN env var if gofile.io ever rotates it.
-GOFILE_WEBSITE_TOKEN: str = os.environ.get("GOFILE_WEBSITE_TOKEN", "4fd6sg89d7s6")
 
 # gofile.io generates thumbnail files alongside every media file; their names
 # always start with "thumb_".  We never want to surface these to the user.
@@ -75,23 +69,12 @@ _PAGE_RENDER_WAIT_SECONDS: int = 8
 # we use 4000 to leave a safe buffer for any formatting overhead).
 _MAX_MESSAGE_LEN: int = 4000
 
-# Maximum characters to capture from an element's textContent when using it
-# as a filename hint during the JavaScript broad-attribute scan.
-_MAX_ELEMENT_TEXT_LEN: int = 200
-
-# Maximum React fiber tree depth to traverse when looking for folder contents.
-# Limits worst-case execution time in very deep component trees.
-_MAX_FIBER_DEPTH: int = 150
-
 # ---------------------------------------------------------------------------
 # Browser / session state
 # ---------------------------------------------------------------------------
 
 _driver: "webdriver.Firefox | None" = None
 _authenticated: bool = False
-
-# Cached guest API token (reused across calls to avoid creating many accounts).
-_guest_api_token: str = ""
 
 
 
@@ -136,263 +119,161 @@ def _ensure_auth() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _get_api_token() -> str:
-    """Return a valid gofile.io API token.
+def _pick_server(servers_str: str) -> str:
+    """Return the best download server from a comma-separated list.
 
-    Prefers the real account token extracted from the authenticated browser
-    session's localStorage (so private/account-owned content is accessible).
-    Falls back to creating a fresh guest account token via the public API.
-    The guest token is cached globally to avoid creating many accounts.
+    Prefers ``file-*`` servers (direct download nodes) over ``store-*``
+    servers.  Falls back to the first entry when no ``file-*`` server is
+    present.
     """
-    global _guest_api_token
-
-    # Prefer the real account token from the already-authenticated browser.
-    if _authenticated:
-        try:
-            driver = _get_driver()
-            acct_token = driver.execute_script(
-                "return localStorage.getItem('accountToken')"
-                " || localStorage.getItem('token')"
-                " || localStorage.getItem('auth_token');"
-            )
-            if acct_token and str(acct_token).strip():
-                return str(acct_token).strip()
-        except Exception as exc:
-            logger.debug("Could not read token from browser localStorage: %s", exc)
-
-    # Reuse a cached guest token to avoid creating many accounts.
-    if _guest_api_token:
-        return _guest_api_token
-
-    resp = _requests.post("https://api.gofile.io/accounts", timeout=15)
-    resp.raise_for_status()
-    data = resp.json()
-    if data.get("status") != "ok":
-        raise RuntimeError(
-            f"gofile.io /accounts returned status={data.get('status')!r}"
-        )
-    _guest_api_token = data["data"]["token"]
-    logger.info("Created gofile.io guest API token.")
-    return _guest_api_token
+    if not servers_str:
+        return ""
+    parts = [s.strip() for s in servers_str.split(",") if s.strip()]
+    for s in parts:
+        if s.startswith("file-"):
+            return s
+    return parts[0] if parts else ""
 
 
-def _scrape_via_api(folder_url: str) -> "list[dict]":
-    """Fetch folder contents via the gofile.io JSON API.
+def _scrape_via_properties(url: str) -> "list[dict]":
+    """Navigate to a gofile.io folder and scrape files via the Properties dialog.
 
-    This is the primary and most reliable extraction method.  The API returns
-    full metadata (name, link, size, md5) for **all** file types and folder
-    sizes.  The DOM/page-source approach only works for single media files
-    because gofile.io embeds the URL in a video player; for .rar archives,
-    zip files, and multi-file folders the download URL is never written into
-    the HTML — it is only loaded on-demand via JavaScript.
-    """
-    match = GOFILE_FOLDER_RE.search(folder_url)
-    if not match:
-        return []
-    folder_id = match.group(1)
-
-    token = _get_api_token()
-    api_url = (
-        f"https://api.gofile.io/contents/{folder_id}"
-        f"?wt={GOFILE_WEBSITE_TOKEN}&cache=true"
-    )
-    resp = _requests.get(
-        api_url,
-        headers={"Authorization": f"Bearer {token}"},
-        timeout=20,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-
-    if data.get("status") != "ok":
-        logger.warning(
-            "gofile.io API returned status=%r for %s", data.get("status"), folder_url
-        )
-        return []
-
-    children = data.get("data", {}).get("children", {})
-    files: list[dict] = []
-    for item in children.values():
-        if item.get("type") != "file":
-            continue
-        name = item.get("name", "")
-        link = item.get("link") or item.get("directLink") or ""
-        if not link or _is_thumbnail(name):
-            continue
-        files.append(
-            {
-                "name": name,
-                "url": link,
-                "size": item.get("size"),
-                "md5": item.get("md5"),
-            }
-        )
-    logger.info("API extracted %d file(s) from %s.", len(files), folder_url)
-    return files
-
-
-def _scrape_via_dom(url: str) -> "list[dict]":
-    """Navigate to the folder page in the authenticated browser and scrape all file links.
-
-    Uses four passes in order of preference:
-
-    1. Standard ``<a href="...">`` elements – works for single-file folders
-       where gofile.io renders a prominent download button.
-    2. JavaScript broad attribute scan – checks every element's ``href``,
-       ``data-link``, ``data-url``, ``data-href``, and ``data-download``
-       attributes for any gofile.io URL.  Catches download row wrappers and
-       buttons that are not plain ``<a>`` tags.
-    3. React fiber state extraction – the SPA stores the full API response
-       (including all file download URLs) in React component memory.  Walking
-       the fiber tree is the most reliable way to get multi-file folder data
-       when the download links are not directly injected into the DOM as plain
-       anchor tags.
-    4. Raw page-source regex – last-resort scan of the rendered HTML.
+    For each file listed in the folder:
+      1. Click the 3-dot (⋮) action menu button in the file's row.
+      2. Click "Properties" in the resulting dropdown.
+      3. Read the file ID and server list from the modal dialog.
+      4. Construct the download URL:
+             https://{server}.gofile.io/download/web/{file_id}/{filename}
+      5. Dismiss the modal before moving to the next file.
     """
     driver = _get_driver()
     logger.info("Loading folder page via browser: %s", url)
     driver.get(url)
-    # Allow the React SPA to render and complete its async content fetch.
     time.sleep(_PAGE_RENDER_WAIT_SECONDS)
 
     files: list[dict] = []
-    seen: set = set()
 
-    def _add(href: str, name: str = "") -> None:
-        """Validate, de-duplicate, and append a download URL (unless a thumbnail)."""
-        href = href.strip()
-        if not href or href in seen:
-            return
-        # Only accept URLs that match the gofile.io download pattern:
-        # https://<subdomain>.gofile.io/download/...
-        if not GOFILE_DOWNLOAD_RE.match(href):
-            return
-        # Strip query-string / fragment before deriving the filename from the path.
-        path = urlparse(href).path
-        resolved_name = name or unquote(path.rstrip("/").split("/")[-1])
-        if _is_thumbnail(resolved_name):
-            return
-        seen.add(href)
-        files.append({"name": resolved_name, "url": href})
+    # Collect file names from anchor tags whose href is exactly
+    # "javascript:void(0);" – gofile.io renders every file name as such an
+    # anchor in the folder listing.
+    file_names: list[str] = []
+    for el in driver.find_elements(By.CSS_SELECTOR, 'a[href="javascript:void(0);"]'):
+        name = (el.text or "").strip()
+        if name and not _is_thumbnail(name):
+            file_names.append(name)
 
-    # Pass 1 – standard <a> elements with a href attribute.
-    for element in driver.find_elements(By.TAG_NAME, "a"):
+    logger.info("Found %d file name(s) in folder.", len(file_names))
+
+    for fname in file_names:
         try:
-            href = element.get_attribute("href") or ""
-        except Exception:
-            continue
-        _add(href)
+            # Re-locate the element on every iteration because closing the
+            # Properties modal may cause the SPA to partially re-render.
+            file_el = None
+            for el in driver.find_elements(
+                By.CSS_SELECTOR, 'a[href="javascript:void(0);"]'
+            ):
+                if (el.text or "").strip() == fname:
+                    file_el = el
+                    break
 
-    # Pass 2 – JavaScript broad attribute scan covering href, data-link, data-url,
-    # data-href, and data-download on *any* element type (download buttons, row
-    # wrappers, etc. that are not plain <a> tags).
-    try:
-        js_items: list = driver.execute_script(
-            f"""
-            const results = [];
-            const attrs = ['href', 'data-link', 'data-url', 'data-href', 'data-download'];
-            document.querySelectorAll('*').forEach(function(el) {{
-                attrs.forEach(function(attr) {{
-                    const u = el.getAttribute(attr);
-                    if (u && u.indexOf('.gofile.io/download/') !== -1) {{
-                        results.push([u, el.textContent.trim().slice(0, {_MAX_ELEMENT_TEXT_LEN})]);
-                    }}
-                }});
-            }});
-            return results;
-            """
-        ) or []
-        for item in js_items:
-            if isinstance(item, (list, tuple)) and len(item) >= 2:
-                _add(str(item[0]), str(item[1]) if item[1] else "")
-    except Exception as exc:
-        logger.debug("JavaScript broad-attribute scan failed: %s", exc)
+            if file_el is None:
+                logger.warning("Could not re-find anchor for file %r", fname)
+                continue
 
-    # Pass 3 – React fiber state extraction.
-    #
-    # gofile.io is a React SPA.  After the folder page loads, the SPA fetches
-    # the folder contents from api.gofile.io and stores the response in React
-    # component state.  We walk the React fiber tree looking for the standard
-    # gofile.io contents object ``{type: "file", name: ..., link: ...}``.
-    # This is the most reliable path for multi-file folders where the individual
-    # download links are not injected as plain anchor tags.
-    if not files:
-        try:
-            react_files: list = driver.execute_script(
-                f"""
-                try {{
-                    function findContents(fiber, depth) {{
-                        if (!fiber || depth > {_MAX_FIBER_DEPTH}) return null;
-                        for (var s = fiber.memoizedState; s; s = s.next) {{
-                            var v = s.memoizedState;
-                            if (v && typeof v === 'object' && !Array.isArray(v)) {{
-                                var contents = null;
-                                if (v.contents && typeof v.contents === 'object')
-                                    contents = v.contents;
-                                else if (v.data && v.data.contents)
-                                    contents = v.data.contents;
-                                else if (v.status === 'ok' && v.data && v.data.contents)
-                                    contents = v.data.contents;
-                                if (contents) {{
-                                    var items = Object.values(contents).filter(function(i) {{
-                                        return i && i.type === 'file' && (i.link || i.directLink);
-                                    }});
-                                    if (items.length > 0) return items.map(function(i) {{
-                                        return {{
-                                            name: i.name || '',
-                                            url: i.link || i.directLink || '',
-                                            size: i.size || null,
-                                            md5: i.md5 || null
-                                        }};
-                                    }});
-                                }}
-                            }}
-                        }}
-                        return findContents(fiber.child, depth + 1)
-                            || findContents(fiber.sibling, depth + 1);
-                    }}
-                    var root = document.getElementById('root') || document.body;
-                    var key = Object.keys(root).find(function(k) {{
-                        return k.indexOf('__reactFiber') === 0
-                            || k.indexOf('__reactInternalInstance') === 0;
-                    }});
-                    if (key) return findContents(root[key], 0);
-                }} catch(e) {{}}
-                return null;
-                """
+            # Scroll the file row into view so hidden buttons become interactive.
+            driver.execute_script(
+                "arguments[0].scrollIntoView({block:'center'});", file_el
             )
-            if react_files and isinstance(react_files, list):
-                logger.info(
-                    "React fiber extracted %d file(s) from folder state.", len(react_files)
+            time.sleep(0.3)
+
+            # Walk up the DOM from the file name anchor to the nearest container
+            # that holds at least one <button>, then return the last such button
+            # (which is the 3-dot / more-options button).
+            three_dot = driver.execute_script(
+                """
+                var el = arguments[0];
+                for (var i = 0; i < 12; i++) {
+                    if (!el.parentElement) break;
+                    el = el.parentElement;
+                    var btns = el.querySelectorAll('button');
+                    if (btns.length > 0) return btns[btns.length - 1];
+                }
+                return null;
+                """,
+                file_el,
+            )
+
+            if three_dot is None:
+                logger.warning("3-dot button not found for %r", fname)
+                continue
+
+            three_dot.click()
+            time.sleep(0.5)
+
+            # Find the visible "Properties" menu item in the dropdown.
+            props_item = None
+            for el in driver.find_elements(By.XPATH, "//*[text()='Properties']"):
+                if el.is_displayed():
+                    props_item = el
+                    break
+
+            if props_item is None:
+                logger.warning("'Properties' menu item not found for %r", fname)
+                driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
+                time.sleep(0.3)
+                continue
+
+            props_item.click()
+            time.sleep(1.0)
+
+            # Extract file ID (UUID) and server list from the modal body text.
+            body_text = driver.find_element(By.TAG_NAME, "body").text
+            id_m = re.search(
+                r"ID[\s:]+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}"
+                r"-[0-9a-f]{4}-[0-9a-f]{12})",
+                body_text,
+                re.IGNORECASE,
+            )
+            srv_m = re.search(
+                r"Servers[\s:]+([A-Za-z0-9,\-]+)",
+                body_text,
+                re.IGNORECASE,
+            )
+
+            if not id_m:
+                logger.warning("Could not extract file ID for %r", fname)
+                driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
+                time.sleep(0.3)
+                continue
+
+            file_id = id_m.group(1)
+            server = _pick_server(srv_m.group(1) if srv_m else "")
+
+            if not server:
+                logger.warning(
+                    "No usable server found for %r (servers=%r)",
+                    fname,
+                    srv_m.group(1) if srv_m else "",
                 )
-                for item in react_files:
-                    if not isinstance(item, dict):
-                        continue
-                    item_url = item.get("url", "")
-                    item_name = item.get("name", "")
-                    if item_url and not _is_thumbnail(item_name):
-                        if item_url not in seen:
-                            seen.add(item_url)
-                            files.append(
-                                {
-                                    "name": item_name,
-                                    "url": item_url,
-                                    "size": item.get("size"),
-                                    "md5": item.get("md5"),
-                                }
-                            )
+                driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
+                time.sleep(0.3)
+                continue
+
+            download_url = (
+                f"https://{server}.gofile.io/download/web/{file_id}/{fname}"
+            )
+            files.append({"name": fname, "url": download_url})
+            logger.info("Constructed URL for %r: %s", fname, download_url)
+
         except Exception as exc:
-            logger.debug("React fiber extraction failed: %s", exc)
-
-    if files:
-        return files
-
-    # Pass 4 – regex-scan the raw page source as a last-resort fallback.
-    try:
-        for raw_url in GOFILE_DOWNLOAD_RE.findall(driver.page_source):
-            _add(raw_url.rstrip("\"'\\"))
-    except Exception as exc:
-        logger.warning("Page-source scan failed: %s", exc)
+            logger.warning("Error scraping properties for %r: %s", fname, exc)
+        finally:
+            # Always try to dismiss any open modal or dropdown before continuing.
+            try:
+                driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
+                time.sleep(0.2)
+            except Exception:
+                pass
 
     return files
 
@@ -403,30 +284,12 @@ def scrape_folder(folder_url: str) -> "list[dict]":
 
     _ensure_auth()
 
-    # -----------------------------------------------------------------------
-    # Step 1 – gofile.io JSON API (primary method).
-    #
-    # The API is reliable for all file types: single files, multi-file folders,
-    # .rar/.zip archives, etc.  The DOM/page-source approach only works for
-    # single media files (video player embeds the URL in the HTML); for all
-    # other types the download URL is never placed in the page source.
-    # -----------------------------------------------------------------------
+    # Primary attempt: Properties-dialog method.
+    files: list[dict] = []
     try:
-        files = _scrape_via_api(folder_url)
-        if files:
-            return files
-        logger.info("API returned no files for %s; falling back to DOM.", folder_url)
-    except Exception as exc:
-        logger.warning("API scrape failed (%s); falling back to DOM.", exc)
-
-    # -----------------------------------------------------------------------
-    # Step 2 – DOM scraping fallback (handles edge cases, new URL patterns).
-    # -----------------------------------------------------------------------
-    files = []
-    try:
-        files = _scrape_via_dom(folder_url)
+        files = _scrape_via_properties(folder_url)
     except WebDriverException as exc:
-        logger.error("WebDriver error during DOM scrape: %s", exc)
+        logger.error("WebDriver error during properties scrape: %s", exc)
         try:
             if _driver:
                 _driver.quit()
@@ -439,25 +302,15 @@ def scrape_folder(folder_url: str) -> "list[dict]":
     if files:
         return files
 
-    # -----------------------------------------------------------------------
-    # Step 3 – Nothing found; session may have expired.
-    #           Re-authenticate once and retry API + DOM.
-    # -----------------------------------------------------------------------
+    # Nothing found; session may have expired.  Re-authenticate once and retry.
     logger.info("No files found; re-authenticating and retrying…")
     _authenticated = False
     _login()
 
     try:
-        files = _scrape_via_api(folder_url)
-        if files:
-            return files
-    except Exception as exc:
-        logger.warning("API retry failed: %s", exc)
-
-    try:
-        files = _scrape_via_dom(folder_url)
+        files = _scrape_via_properties(folder_url)
     except WebDriverException as exc:
-        logger.error("WebDriver error during retry DOM scrape: %s", exc)
+        logger.error("WebDriver error during retry: %s", exc)
         try:
             if _driver:
                 _driver.quit()
@@ -541,10 +394,10 @@ async def _send_reply(
 def _scrape_debug_report(url: str) -> str:
     """Run a full instrumented scrape and return a detailed plain-text report.
 
-    Captures: auth state, page source, all <a> hrefs, every element with a
-    gofile.io attribute (Pass 2), the raw React fiber output (Pass 3 without
-    filtering), all GOFILE_DOWNLOAD_RE regex matches (Pass 4), and every
-    gofile.io URL found anywhere in the rendered page source.
+    Captures: auth state, page source excerpt, all file names found on the
+    page, and for each file the result of opening its Properties dialog
+    (3-dot → Properties) including the raw modal text, extracted ID and
+    servers, and the constructed download URL.
     """
     lines: list[str] = []
     ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -569,183 +422,141 @@ def _scrape_debug_report(url: str) -> str:
     lines.append(f"[LOAD] Page title: {driver.title!r}")
     lines.append("")
 
-    # -------------------------------------------------------------------
-    # Page source
-    # -------------------------------------------------------------------
+    # Page source excerpt (useful for verifying the page rendered correctly).
     page_source: str = driver.page_source or ""
     lines.append(f"[PAGE_SOURCE] Total length: {len(page_source)} chars")
-    lines.append("[PAGE_SOURCE] ── first 3000 chars ──")
-    lines.append(page_source[:3000])
-    lines.append("[PAGE_SOURCE] ── last 1000 chars ──")
-    lines.append(page_source[-1000:])
+    lines.append("[PAGE_SOURCE] ── first 2000 chars ──")
+    lines.append(page_source[:2000])
     lines.append("")
 
-    # -------------------------------------------------------------------
-    # Pass 1 – all <a> tags
-    # -------------------------------------------------------------------
-    lines.append("=== PASS 1: all <a href> elements ===")
-    a_tags: list[tuple[str, str]] = []
-    for element in driver.find_elements(By.TAG_NAME, "a"):
+    # File names discovered from anchor tags.
+    lines.append("=== FILE NAMES FOUND ===")
+    file_names_found: list[str] = []
+    for el in driver.find_elements(By.CSS_SELECTOR, 'a[href="javascript:void(0);"]'):
+        name = (el.text or "").strip()
+        if name and not _is_thumbnail(name):
+            file_names_found.append(name)
+    lines.append(f"Total: {len(file_names_found)}")
+    for i, n in enumerate(file_names_found, 1):
+        lines.append(f"  [{i:03d}] {n!r}")
+    lines.append("")
+
+    # Per-file Properties scrape.
+    lines.append("=== PROPERTIES SCRAPE (3-dot → Properties per file) ===")
+    for fname in file_names_found:
+        lines.append(f"\n--- File: {fname!r} ---")
         try:
-            href = element.get_attribute("href") or ""
-            text = (element.text or "").replace("\n", " ")[:120]
-            a_tags.append((href, text))
-        except Exception as exc:
-            a_tags.append((f"ERROR:{exc}", ""))
-    lines.append(f"Total <a> elements: {len(a_tags)}")
-    for i, (href, text) in enumerate(a_tags, 1):
-        lines.append(f"  [{i:03d}] href={href!r}  text={text!r}")
-    lines.append("")
+            file_el = None
+            for el in driver.find_elements(
+                By.CSS_SELECTOR, 'a[href="javascript:void(0);"]'
+            ):
+                if (el.text or "").strip() == fname:
+                    file_el = el
+                    break
 
-    # -------------------------------------------------------------------
-    # Pass 2 – JS attribute scan (broad – all gofile.io, not just /download/)
-    # -------------------------------------------------------------------
-    lines.append("=== PASS 2: JS broad attribute scan (all gofile.io) ===")
-    try:
-        js_items: list = driver.execute_script(
-            """
-            const results = [];
-            const attrs = ['href', 'data-link', 'data-url', 'data-href', 'data-download'];
-            document.querySelectorAll('*').forEach(function(el) {
-                attrs.forEach(function(attr) {
-                    const u = el.getAttribute(attr);
-                    if (u && u.indexOf('gofile.io') !== -1) {
-                        results.push([
-                            attr,
-                            u,
-                            el.tagName,
-                            el.className,
-                            el.textContent.trim().slice(0, 200)
-                        ]);
-                    }
-                });
-            });
-            return results;
-            """
-        ) or []
-        lines.append(f"Total matches: {len(js_items)}")
-        for i, item in enumerate(js_items, 1):
-            attr, u, tag, cls, text = (list(item) + ["", "", "", "", ""])[:5]
+            if file_el is None:
+                lines.append("  ERROR: could not re-find element")
+                continue
+
+            driver.execute_script(
+                "arguments[0].scrollIntoView({block:'center'});", file_el
+            )
+            time.sleep(0.3)
+
+            three_dot = driver.execute_script(
+                """
+                var el = arguments[0];
+                for (var i = 0; i < 12; i++) {
+                    if (!el.parentElement) break;
+                    el = el.parentElement;
+                    var btns = el.querySelectorAll('button');
+                    if (btns.length > 0) return btns[btns.length - 1];
+                }
+                return null;
+                """,
+                file_el,
+            )
+
+            if three_dot is None:
+                lines.append("  ERROR: 3-dot button not found in parent tree")
+                continue
+
+            lines.append("  3-dot button found – clicking …")
+            three_dot.click()
+            time.sleep(0.5)
+
+            # Capture visible dropdown text for diagnostics.
+            dropdown_text = (
+                driver.execute_script(
+                    "var m = document.querySelector('[role=menu],[role=listbox]');"
+                    "return m ? m.innerText : '';"
+                )
+                or ""
+            )
+            lines.append(f"  Dropdown text: {dropdown_text[:300]!r}")
+
+            props_item = None
+            for el in driver.find_elements(By.XPATH, "//*[text()='Properties']"):
+                if el.is_displayed():
+                    props_item = el
+                    break
+
+            if props_item is None:
+                lines.append("  ERROR: 'Properties' menu item not visible")
+                driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
+                time.sleep(0.3)
+                continue
+
+            props_item.click()
+            time.sleep(1.0)
+
+            body_text = driver.find_element(By.TAG_NAME, "body").text
+
+            # Show the relevant portion of the modal.
+            modal_start = body_text.find("File Details")
+            if modal_start == -1:
+                modal_start = max(0, body_text.find("ID") - 20)
             lines.append(
-                f"  [{i:03d}] attr={attr!r}  url={u!r}  "
-                f"tag={tag!r}  class={str(cls)[:60]!r}  text={str(text)[:80]!r}"
+                "  Modal text excerpt:\n"
+                + body_text[modal_start: modal_start + 600]
             )
-    except Exception as exc:
-        lines.append(f"ERROR: {exc}")
-    lines.append("")
 
-    # -------------------------------------------------------------------
-    # Pass 3 – React fiber (raw, unfiltered – shows all keys present)
-    # -------------------------------------------------------------------
-    lines.append("=== PASS 3: React fiber raw extraction ===")
-    try:
-        fiber_raw = driver.execute_script(
-            f"""
-            try {{
-                function findContents(fiber, depth) {{
-                    if (!fiber || depth > {_MAX_FIBER_DEPTH}) return null;
-                    for (var s = fiber.memoizedState; s; s = s.next) {{
-                        var v = s.memoizedState;
-                        if (v && typeof v === 'object' && !Array.isArray(v)) {{
-                            var contents = null;
-                            if (v.contents && typeof v.contents === 'object')
-                                contents = v.contents;
-                            else if (v.data && v.data.contents)
-                                contents = v.data.contents;
-                            else if (v.status === 'ok' && v.data && v.data.contents)
-                                contents = v.data.contents;
-                            if (contents) {{
-                                return Object.values(contents).map(function(i) {{
-                                    if (!i || typeof i !== 'object') return {{raw: String(i)}};
-                                    var out = {{}};
-                                    Object.keys(i).forEach(function(k) {{
-                                        var val = i[k];
-                                        out[k] = (typeof val === 'object' && val !== null)
-                                            ? '[object]' : val;
-                                    }});
-                                    return out;
-                                }});
-                            }}
-                        }}
-                    }}
-                    return findContents(fiber.child, depth + 1)
-                        || findContents(fiber.sibling, depth + 1);
-                }}
-                var root = document.getElementById('root') || document.body;
-                var key = Object.keys(root).find(function(k) {{
-                    return k.indexOf('__reactFiber') === 0
-                        || k.indexOf('__reactInternalInstance') === 0;
-                }});
-                if (!key) return {{
-                    error: 'No React fiber key found on root element',
-                    rootKeys: Object.keys(root).slice(0, 30)
-                }};
-                var result = findContents(root[key], 0);
-                if (!result) return {{error: 'findContents returned null – fiber walked but no contents object found'}};
-                return result;
-            }} catch(e) {{
-                return {{error: e.toString(), stack: e.stack || ''}};
-            }}
-            """
-        )
-        lines.append(json.dumps(fiber_raw, indent=2, default=str))
-    except Exception as exc:
-        lines.append(f"ERROR: {exc}")
-    lines.append("")
-
-    # -------------------------------------------------------------------
-    # Pass 4 – regex on page source
-    # -------------------------------------------------------------------
-    lines.append("=== PASS 4: GOFILE_DOWNLOAD_RE regex matches ===")
-    re_matches = GOFILE_DOWNLOAD_RE.findall(page_source)
-    lines.append(f"Matches: {len(re_matches)}")
-    for i, m in enumerate(re_matches, 1):
-        lines.append(f"  [{i:03d}] {m}")
-    lines.append("")
-
-    # -------------------------------------------------------------------
-    # Bonus – every gofile.io URL anywhere in the page source
-    # -------------------------------------------------------------------
-    lines.append("=== BONUS: all gofile.io URLs in page source ===")
-    any_gofile_re = re.compile(r"https?://[^\s\"'<>]*gofile\.io[^\s\"'<>]*")
-    all_gofile_urls = sorted(set(any_gofile_re.findall(page_source)))
-    lines.append(f"Unique URLs: {len(all_gofile_urls)}")
-    for i, u in enumerate(all_gofile_urls, 1):
-        lines.append(f"  [{i:03d}] {u}")
-    lines.append("")
-
-    # -------------------------------------------------------------------
-    # API – direct gofile.io JSON API call (the primary fix path)
-    # -------------------------------------------------------------------
-    lines.append("=== API: gofile.io /contents/{id} JSON response ===")
-    match = GOFILE_FOLDER_RE.search(url)
-    if match:
-        folder_id = match.group(1)
-        try:
-            token = _get_api_token()
-            lines.append(f"Token used (first 8 chars): {token[:8]}…")
-            api_url = (
-                f"https://api.gofile.io/contents/{folder_id}"
-                f"?wt={GOFILE_WEBSITE_TOKEN}&cache=true"
+            id_m = re.search(
+                r"ID[\s:]+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}"
+                r"-[0-9a-f]{4}-[0-9a-f]{12})",
+                body_text,
+                re.IGNORECASE,
             )
-            lines.append(f"API URL: {api_url}")
-            resp = _requests.get(
-                api_url,
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=20,
+            srv_m = re.search(
+                r"Servers[\s:]+([A-Za-z0-9,\-]+)",
+                body_text,
+                re.IGNORECASE,
             )
-            lines.append(f"HTTP status: {resp.status_code}")
-            try:
-                api_data = resp.json()
-                lines.append(json.dumps(api_data, indent=2, default=str))
-            except Exception:
-                lines.append(f"RAW BODY: {resp.text[:3000]}")
+
+            file_id = id_m.group(1) if id_m else "NOT FOUND"
+            servers_raw = srv_m.group(1) if srv_m else "NOT FOUND"
+            lines.append(f"  Extracted ID     : {file_id}")
+            lines.append(f"  Extracted servers: {servers_raw}")
+
+            if id_m:
+                server = _pick_server(srv_m.group(1) if srv_m else "")
+                constructed = (
+                    f"https://{server}.gofile.io/download/web/{file_id}/{fname}"
+                    if server
+                    else "NO SERVER AVAILABLE"
+                )
+                lines.append(f"  Constructed URL  : {constructed}")
+
         except Exception as exc:
-            lines.append(f"ERROR: {exc}")
-    else:
-        lines.append("(Could not extract folder ID from URL)")
-    lines.append("")
+            lines.append(f"  EXCEPTION: {exc}")
+        finally:
+            try:
+                driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
+                time.sleep(0.2)
+            except Exception:
+                pass
 
+    lines.append("")
     lines.append("=== END OF REPORT ===")
     return "\n".join(lines)
 

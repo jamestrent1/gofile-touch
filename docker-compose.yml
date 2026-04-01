@@ -9,8 +9,6 @@ services:
       - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
       # Optional: override the gofile.io direct-login URL for a different account
       # - GOFILE_LOGIN_URL=${GOFILE_LOGIN_URL}
-      # Optional: override the gofile.io website token if API auth starts failing
-      # - GOFILE_WEBSITE_TOKEN=${GOFILE_WEBSITE_TOKEN}
     # Uncomment the lines below to persist the Firefox profile across restarts
     # so that the gofile.io session cookie survives container restarts.
     # volumes:

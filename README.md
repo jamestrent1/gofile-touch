@@ -8,18 +8,19 @@ file names and direct download links inside any gofile.io folder you share.
 ## Features
 
 * Logs in to your gofile.io account automatically before browsing any folder.
-* **Primary extraction: gofile.io JSON API** – calls `api.gofile.io/contents/{id}`
-  directly.  Works reliably for all file types (`.rar`, `.zip`, `.mkv`, multi-file
-  folders, etc.) because the API always returns the full file list with download
-  links, regardless of whether the file is a media type or not.
-* **Fallback: DOM scraping** – loads the folder page in Firefox and extracts links
-  using four passes (anchor tags → broad attribute scan → JavaScript state → page
-  source regex).  Used only when the API returns nothing.
-* `/debug <url>` command – sends a full diagnostic `.txt` report including the raw
-  API JSON response, so any future issues can be diagnosed precisely.
+* **Extraction: Properties-dialog method** – loads the folder page in Firefox,
+  then for every file opens its 3-dot action menu → Properties, reads the
+  **file ID** and **server list** from the dialog, and constructs the download URL:
+
+  ```
+  https://{server}.gofile.io/download/web/{file_id}/{filename}
+  ```
+
+  This works for all file types (`.rar`, `.zip`, `.mkv`, multi-file folders, etc.)
+  because the Properties dialog always shows full file metadata.
+* `/debug <url>` command – sends a detailed diagnostic `.txt` report including
+  the raw Properties dialog output and constructed URLs for each file.
 * Automatically re-authenticates if the session expires.
-* Returns file name, download URL, size, and MD5 (when available) for every
-  file in the folder.
 * Splits long replies into multiple Telegram messages so nothing is cut off.
 * Fully Dockerized (Firefox ESR + GeckoDriver included).
 
@@ -71,11 +72,11 @@ The bot replies with a list like:
 ```
 📁 Found 3 file(s):
 
-1. 📄 Foundation.S01E05.mkv (2.7 GB, MD5: 6e72e28f…)
-   ⬇️ https://cold-na-phx-10.gofile.io/download/web/519b42e9-…/Foundation.S01E05.mkv
+1. 📄 Foundation.S01E05.mkv
+   ⬇️ https://file-na-phx-1.gofile.io/download/web/519b42e9-…/Foundation.S01E05.mkv
 
-2. 📄 Foundation.S01E06.mkv (2.5 GB)
-   ⬇️ https://cold-na-phx-10.gofile.io/download/web/…/Foundation.S01E06.mkv
+2. 📄 Foundation.S01E06.mkv
+   ⬇️ https://file-na-phx-1.gofile.io/download/web/…/Foundation.S01E06.mkv
 …
 ```
 
@@ -90,7 +91,6 @@ Use `/debug https://gofile.io/d/xxxxx` to get a full diagnostic report as a
 |---|---|---|
 | `TELEGRAM_TOKEN` | ✅ | Telegram bot token from @BotFather |
 | `GOFILE_LOGIN_URL` | ❌ | Direct-login URL for the gofile.io account (defaults to the bundled URL) |
-| `GOFILE_WEBSITE_TOKEN` | ❌ | Website token used as the `wt` parameter in API requests (default: `4fd6sg89d7s6`). Update if gofile.io rotates it. |
 
 ---
 
@@ -98,18 +98,16 @@ Use `/debug https://gofile.io/d/xxxxx` to get a full diagnostic report as a
 
 ```
 bot.py
- ├── _login()           – Opens LOGIN_URL in Firefox, sets session cookies
- ├── _get_api_token()   – Reads account token from browser localStorage,
- │                        or creates a guest token via POST /accounts
- ├── _scrape_via_api()  – PRIMARY: GET api.gofile.io/contents/{id}
- │                        → returns all files for any file type / folder size
- ├── _scrape_via_dom()  – FALLBACK: loads folder in browser; 4-pass extraction:
- │    ├── Pass 1: <a href> anchor tags
- │    ├── Pass 2: broad JS attribute scan (data-link, data-url, …)
- │    ├── Pass 3: JavaScript state traversal
- │    └── Pass 4: page-source regex fallback
- ├── scrape_folder()    – API → if empty, DOM → if empty, re-auth → API+DOM retry
- └── handle_message()   – Telegram message handler
+ ├── _login()                  – Opens LOGIN_URL in Firefox, sets session cookies
+ ├── _pick_server()            – Picks best download server (prefers file-* over store-*)
+ ├── _scrape_via_properties()  – Loads folder page; for each file:
+ │    ├── Finds the file name anchor (a[href="javascript:void(0);"])
+ │    ├── Walks up the DOM to click the last <button> (3-dot menu)
+ │    ├── Clicks "Properties" in the dropdown
+ │    ├── Extracts file ID (UUID) and servers from the modal
+ │    └── Constructs: https://{server}.gofile.io/download/web/{id}/{name}
+ ├── scrape_folder()           – Calls _scrape_via_properties; re-auths on failure
+ └── handle_message()          – Telegram message handler
 ```
 
 ---
@@ -118,6 +116,4 @@ bot.py
 
 * The direct-login URL (`LOGIN_URL` in `bot.py`) is tied to a specific gofile.io
   account. Replace it (or set `GOFILE_LOGIN_URL`) if you use a different account.
-* The website token (`wt=4fd6sg89d7s6`) is gofile.io's public web-app token
-  embedded in their JavaScript bundle.  If it ever changes, set the
-  `GOFILE_WEBSITE_TOKEN` environment variable to the new value.
+
