@@ -156,8 +156,9 @@ def _scrape_via_dom(url: str) -> "list[dict]":
         href = href.strip()
         if not href or href in seen:
             return
-        # Accept any https URL that belongs to a gofile.io subdomain.
-        if not href.startswith("https://") or "gofile.io" not in href:
+        # Only accept URLs that match the gofile.io download pattern:
+        # https://<subdomain>.gofile.io/download/...
+        if not GOFILE_DOWNLOAD_RE.match(href):
             return
         # Strip query-string / fragment before deriving the filename from the path.
         path = urlparse(href).path
@@ -186,7 +187,7 @@ def _scrape_via_dom(url: str) -> "list[dict]":
             document.querySelectorAll('*').forEach(function(el) {{
                 attrs.forEach(function(attr) {{
                     const u = el.getAttribute(attr);
-                    if (u && u.indexOf('gofile.io') !== -1) {{
+                    if (u && u.indexOf('.gofile.io/download/') !== -1) {{
                         results.push([u, el.textContent.trim().slice(0, {_MAX_ELEMENT_TEXT_LEN})]);
                     }}
                 }});
