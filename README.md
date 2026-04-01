@@ -8,11 +8,14 @@ file names and direct download links inside any gofile.io folder you share.
 ## Features
 
 * Logs in to your gofile.io account automatically before browsing any folder.
-* Supports two extraction strategies (fastest/most reliable tried first):
-  1. **gofile.io REST API** – uses the account token extracted from the
-     authenticated browser session for clean structured data.
-  2. **Selenium DOM scraping** – opens the folder page in the real Firefox
-     browser and locates download links in the rendered HTML.
+* Extracts file links using four passes (fastest/most reliable tried first):
+  1. **Anchor tags** – standard `<a href="...">` elements for single-file folders.
+  2. **Broad attribute scan** – checks every element's `href`, `data-link`,
+     `data-url`, `data-href`, and `data-download` attributes for gofile.io URLs.
+  3. **React fiber extraction** – walks the React component tree to read the
+     full file list directly from the SPA's JavaScript state (the most reliable
+     path for multi-file / non-media folders).
+  4. **Page-source regex** – last-resort scan of the raw rendered HTML.
 * Automatically re-authenticates if the session expires.
 * Returns file name, download URL, size, and MD5 (when available) for every
   file in the folder.
@@ -83,7 +86,6 @@ The bot replies with a list like:
 |---|---|---|
 | `TELEGRAM_TOKEN` | ✅ | Telegram bot token from @BotFather |
 | `GOFILE_LOGIN_URL` | ❌ | Direct-login URL for the gofile.io account (defaults to the bundled URL) |
-| `GOFILE_WEBSITE_TOKEN` | ❌ | Emergency fallback for the gofile.io website token. The bot automatically extracts the live token from the browser after each page load (it rotates every ~4 hours). Only set this if all automatic extraction methods fail. |
 
 ---
 
@@ -91,12 +93,14 @@ The bot replies with a list like:
 
 ```
 bot.py
- ├── _login()                  – Opens LOGIN_URL in Firefox, sets session cookies
- ├── _refresh_website_token()  – Extracts live wt token from browser performance entries
- ├── _scrape_via_dom()         – Loads folder in browser, refreshes wt, scrapes links
- ├── _scrape_via_api()         – Calls gofile.io REST API with fresh wt + account token
- ├── scrape_folder()           – DOM load first (refreshes wt) → API call → DOM fallback
- └── handle_message()          – Telegram message handler
+ ├── _login()          – Opens LOGIN_URL in Firefox, sets session cookies
+ ├── _scrape_via_dom() – Loads folder in browser; 4-pass extraction:
+ │    ├── Pass 1: <a href> anchor tags
+ │    ├── Pass 2: broad JS attribute scan (data-link, data-url, …)
+ │    ├── Pass 3: React fiber state traversal (multi-file / non-media)
+ │    └── Pass 4: page-source regex fallback
+ ├── scrape_folder()   – DOM scrape → if empty, re-auth → DOM retry
+ └── handle_message()  – Telegram message handler
 ```
 
 ---
@@ -104,10 +108,4 @@ bot.py
 ## Notes
 
 * The direct-login URL (`LOGIN_URL` in `bot.py`) is tied to a specific gofile.io
-  account. Replace it if you use a different account.
-* The gofile.io website token (`wt`) rotates roughly every 4 hours and is
-  unique per account. The bot automatically extracts it from the browser's
-  performance resource-timing entries after every page load — no manual
-  configuration is needed. The `GOFILE_WEBSITE_TOKEN` environment variable
-  is an emergency override that is only used if all automatic extraction
-  methods fail.
+  account. Replace it (or set `GOFILE_LOGIN_URL`) if you use a different account.

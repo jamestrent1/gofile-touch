@@ -12,9 +12,8 @@ import logging
 import os
 import re
 import time
-from urllib.parse import unquote
+from urllib.parse import unquote, urlparse
 
-import requests
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.firefox.options import Options
@@ -56,33 +55,25 @@ def _is_thumbnail(name: str) -> bool:
     """Return True if the filename is a gofile.io auto-generated thumbnail."""
     return name.lower().startswith("thumb_")
 
-# Legacy fallback website token (override via GOFILE_WEBSITE_TOKEN env var).
-# NOTE: gofile.io's website token is now dynamic – it rotates roughly every
-# 4 hours and differs per account.  The bot extracts the live token from the
-# browser's performance resource entries after each page navigation, so this
-# constant is only used when all extraction attempts fail.
-_GOFILE_WEBSITE_TOKEN: str = os.environ.get("GOFILE_WEBSITE_TOKEN", "")
-
-# ---------------------------------------------------------------------------
-# Website-token cache (the token rotates ~every 4 h; we refresh every 3.5 h)
-# ---------------------------------------------------------------------------
-
-_cached_wt: str = ""
-_wt_fetched_at: float = 0.0
-_WT_TTL_SECONDS: int = 12600  # 3.5 hours (token rotates every ~4 h)
-
 # How long (seconds) to wait after the login redirect for cookies to be set.
 _LOGIN_WAIT_SECONDS: int = 6
 
 # How long (seconds) to wait for the React SPA to fully render a folder page.
-_PAGE_RENDER_WAIT_SECONDS: int = 5
-
-# Timeout (seconds) for REST API requests.
-_API_REQUEST_TIMEOUT: int = 30
+# Multi-file folders require the SPA to make an async API call and re-render,
+# so 8 seconds is safer than 5.
+_PAGE_RENDER_WAIT_SECONDS: int = 8
 
 # Maximum characters per Telegram message (Telegram limit is 4096;
 # we use 4000 to leave a safe buffer for any formatting overhead).
 _MAX_MESSAGE_LEN: int = 4000
+
+# Maximum characters to capture from an element's textContent when using it
+# as a filename hint during the JavaScript broad-attribute scan.
+_MAX_ELEMENT_TEXT_LEN: int = 200
+
+# Maximum React fiber tree depth to traverse when looking for folder contents.
+# Limits worst-case execution time in very deep component trees.
+_MAX_FIBER_DEPTH: int = 150
 
 # ---------------------------------------------------------------------------
 # Browser / session state
@@ -121,8 +112,6 @@ def _login() -> None:
     time.sleep(_LOGIN_WAIT_SECONDS)
     logger.info("Authentication step completed. Current URL: %s", driver.current_url)
     _authenticated = True
-    # Attempt to grab the website token now that the SPA has initialised.
-    _refresh_website_token()
 
 
 def _ensure_auth() -> None:
@@ -135,254 +124,48 @@ def _ensure_auth() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _get_account_token() -> "str | None":
-    """Extract the gofile.io account token from the browser's storage or cookies.
-
-    gofile.io may store the token under different keys depending on the app
-    version.  We try localStorage first (multiple known key names), then
-    sessionStorage, then browser cookies.
-    """
-    driver = _get_driver()
-    # --- localStorage / sessionStorage ---
-    try:
-        token = driver.execute_script(
-            """
-            const keys = ['accountToken', 'token', 'userToken', 'account'];
-            for (const k of keys) {
-                const v = localStorage.getItem(k) || sessionStorage.getItem(k);
-                if (v && v.length > 8) return v;
-            }
-            return null;
-            """
-        )
-        if token:
-            logger.info("Account token extracted from browser storage.")
-            return str(token)
-    except Exception as exc:
-        logger.debug("Browser storage access failed: %s", exc)
-    # --- cookies ---
-    try:
-        for cookie in driver.get_cookies():
-            if cookie.get("name") in ("accountToken", "token"):
-                value = cookie.get("value", "")
-                if len(value) > 8:
-                    logger.info("Account token extracted from browser cookie.")
-                    return value
-    except Exception as exc:
-        logger.debug("Cookie access failed: %s", exc)
-    logger.info("No account token found; skipping API scrape.")
-    return None
-
-
-def _refresh_website_token() -> None:
-    """Fetch the live gofile.io website token and cache it.
-
-    gofile.io's website token (``wt``) rotates roughly every 4 hours and is
-    unique per account.  We try four methods in order of reliability:
-
-    0. **Direct API call** to ``/accounts/getid`` – the same public endpoint
-       that the gofile.io SPA calls on startup to obtain the rotating guest /
-       website token.  No browser required; this is the authoritative source.
-    1. **Performance resource entries** – if the SPA already ran in the browser
-       and made an API call with ``wt=`` as a query parameter we can read it
-       back from ``performance.getEntriesByType('resource')``.
-    2. **Window properties** – ``window._wt``, ``window.wt``, etc.
-    3. **Page-source regex** – scan the rendered HTML for ``"wt":"<token>"``.
-    """
-    global _cached_wt, _wt_fetched_at
-
-    # ------------------------------------------------------------------
-    # Method 0 (primary): call /accounts/getid directly.
-    # gofile.io's SPA calls this on every page load to get the current wt.
-    # The returned "id" field IS the website token.
-    # ------------------------------------------------------------------
-    try:
-        resp = requests.get(
-            "https://api.gofile.io/accounts/getid",
-            timeout=10,
-        )
-        resp.raise_for_status()
-        body = resp.json()
-        if body.get("status") == "ok":
-            guest_id: str = body.get("data", {}).get("id", "")
-            if guest_id:
-                _cached_wt = guest_id
-                _wt_fetched_at = time.time()
-                logger.info(
-                    "Website token refreshed via /accounts/getid: %s…", guest_id[:6]
-                )
-                return
-    except Exception as exc:
-        logger.debug("/accounts/getid call failed: %s", exc)
-
-    # ------------------------------------------------------------------
-    # Methods 1–3: browser-based fallbacks (require an active page load).
-    # ------------------------------------------------------------------
-    try:
-        driver = _get_driver()
-    except Exception as exc:
-        logger.debug("Could not get driver for browser-based wt extraction: %s", exc)
-        return
-
-    # Method 1: performance resource entries – the SPA's own API calls embed wt=.
-    # We scan from newest to oldest so we get the most recent token.
-    try:
-        wt = driver.execute_script(
-            """
-            try {
-                var entries = performance.getEntriesByType('resource');
-                for (var i = entries.length - 1; i >= 0; i--) {
-                    var name = entries[i].name || '';
-                    if (name.indexOf('api.gofile.io') !== -1) {
-                        var m = name.match(/[?&]wt=([A-Za-z0-9]+)/);
-                        if (m && m[1].length > 4) return m[1];
-                    }
-                }
-            } catch(e) {}
-            return null;
-            """
-        )
-        if wt and len(str(wt)) > 4:
-            _cached_wt = str(wt)
-            _wt_fetched_at = time.time()
-            logger.info("Website token refreshed from performance entries.")
-            return
-    except Exception as exc:
-        logger.debug("Performance-entry wt extraction failed: %s", exc)
-
-    # Method 2: common window properties set by the gofile.io SPA.
-    try:
-        wt = driver.execute_script(
-            "return window._wt || window.wt || window.websiteToken"
-            " || (window.appdata && window.appdata.wt) || null;"
-        )
-        if wt and len(str(wt)) > 4:
-            _cached_wt = str(wt)
-            _wt_fetched_at = time.time()
-            logger.info("Website token refreshed from window property.")
-            return
-    except Exception as exc:
-        logger.debug("Window-property wt extraction failed: %s", exc)
-
-    # Method 3: regex scan of the page source.
-    try:
-        m = re.search(
-            r"""["']wt["']\s*:\s*["']([A-Za-z0-9]{6,})["']""",
-            driver.page_source,
-        )
-        if m:
-            _cached_wt = m.group(1)
-            _wt_fetched_at = time.time()
-            logger.info("Website token refreshed from page source.")
-            return
-    except Exception as exc:
-        logger.debug("Page-source wt scan failed: %s", exc)
-
-    logger.warning("Could not refresh website token – all methods failed.")
-
-
-def _get_website_token() -> str:
-    """Return a valid gofile.io website token, refreshing the cache if stale."""
-    if _cached_wt and (time.time() - _wt_fetched_at) < _WT_TTL_SECONDS:
-        return _cached_wt
-    _refresh_website_token()
-    return _cached_wt or _GOFILE_WEBSITE_TOKEN
-
-
-def _build_requests_session() -> requests.Session:
-    """Build a requests.Session populated with browser cookies for gofile.io."""
-    driver = _get_driver()
-    session = requests.Session()
-    try:
-        for cookie in driver.get_cookies():
-            domain = cookie.get("domain", "")
-            # Only transfer cookies whose domain is exactly gofile.io or a subdomain of it.
-            if domain == "gofile.io" or domain.endswith(".gofile.io"):
-                session.cookies.set(cookie["name"], cookie["value"])
-    except Exception as exc:
-        logger.debug("Could not transfer browser cookies: %s", exc)
-    return session
-
-
-def _scrape_via_api(folder_id: str) -> "list[dict]":
-    """Use the gofile.io REST API to list folder contents (preferred method)."""
-    token = _get_account_token()
-    if not token:
-        return []
-
-    wt = _get_website_token()
-    if not wt:
-        logger.warning("No website token available; skipping API scrape.")
-        return []
-
-    session = _build_requests_session()
-
-    url = f"https://api.gofile.io/contents/{folder_id}"
-    params: dict = {"token": token, "wt": wt}
-    logger.info("Calling API: %s (wt=%s…)", url, wt[:6] if len(wt) >= 6 else wt)
-
-    try:
-        resp = session.get(url, params=params, timeout=_API_REQUEST_TIMEOUT)
-        resp.raise_for_status()
-        body = resp.json()
-    except Exception as exc:
-        logger.warning("API request failed: %s", exc)
-        return []
-
-    if body.get("status") != "ok":
-        logger.warning(
-            "API returned status=%s (message=%s)", body.get("status"), body.get("message", "")
-        )
-        return []
-
-    contents = body.get("data", {}).get("contents") or {}
-    logger.info("API returned %d item(s) in contents.", len(contents))
-    files: list[dict] = []
-    for item in contents.values():
-        if item.get("type") != "file":
-            continue
-        name = item.get("name", "")
-        if _is_thumbnail(name):
-            continue  # skip auto-generated thumbnail files
-        files.append(
-            {
-                "name": name,
-                "url": item.get("link") or item.get("directLink", ""),
-                "size": item.get("size"),
-                "md5": item.get("md5"),
-                "created": item.get("createTime"),
-            }
-        )
-    return files
-
-
 def _scrape_via_dom(url: str) -> "list[dict]":
-    """Navigate to the folder page in the authenticated browser and scrape download links."""
+    """Navigate to the folder page in the authenticated browser and scrape all file links.
+
+    Uses four passes in order of preference:
+
+    1. Standard ``<a href="...">`` elements – works for single-file folders
+       where gofile.io renders a prominent download button.
+    2. JavaScript broad attribute scan – checks every element's ``href``,
+       ``data-link``, ``data-url``, ``data-href``, and ``data-download``
+       attributes for any gofile.io URL.  Catches download row wrappers and
+       buttons that are not plain ``<a>`` tags.
+    3. React fiber state extraction – the SPA stores the full API response
+       (including all file download URLs) in React component memory.  Walking
+       the fiber tree is the most reliable way to get multi-file folder data
+       when the download links are not directly injected into the DOM as plain
+       anchor tags.
+    4. Raw page-source regex – last-resort scan of the rendered HTML.
+    """
     driver = _get_driver()
     logger.info("Loading folder page via browser: %s", url)
     driver.get(url)
-    # Allow the React SPA to render the file list.
+    # Allow the React SPA to render and complete its async content fetch.
     time.sleep(_PAGE_RENDER_WAIT_SECONDS)
 
     files: list[dict] = []
     seen: set = set()
 
-    # The SPA has now made its own API calls (which contain wt= in the URL).
-    # Grab the website token from the performance entries while we're here.
-    _refresh_website_token()
-
-    def _add(href: str) -> None:
+    def _add(href: str, name: str = "") -> None:
         """Validate, de-duplicate, and append a download URL (unless a thumbnail)."""
         href = href.strip()
         if not href or href in seen:
             return
-        if not GOFILE_DOWNLOAD_RE.match(href):
+        # Accept any https URL that belongs to a gofile.io subdomain.
+        if not href.startswith("https://") or "gofile.io" not in href:
             return
-        name = unquote(href.rstrip("/").split("/")[-1])
-        if _is_thumbnail(name):
+        # Strip query-string / fragment before deriving the filename from the path.
+        path = urlparse(href).path
+        resolved_name = name or unquote(path.rstrip("/").split("/")[-1])
+        if _is_thumbnail(resolved_name):
             return
         seen.add(href)
-        files.append({"name": name, "url": href})
+        files.append({"name": resolved_name, "url": href})
 
     # Pass 1 – standard <a> elements with a href attribute.
     for element in driver.find_elements(By.TAG_NAME, "a"):
@@ -392,31 +175,111 @@ def _scrape_via_dom(url: str) -> "list[dict]":
             continue
         _add(href)
 
-    # Pass 2 – JavaScript querySelectorAll covering href and data-link attributes
-    # on *any* element type.  This catches download buttons, row wrappers, etc.
-    # that are not plain <a> tags (important for non-media files like .rar).
+    # Pass 2 – JavaScript broad attribute scan covering href, data-link, data-url,
+    # data-href, and data-download on *any* element type (download buttons, row
+    # wrappers, etc. that are not plain <a> tags).
     try:
-        js_urls: list = driver.execute_script(
-            """
-            const urls = [];
-            const sel = '[href*="/download/"],[data-link*="/download/"]';
-            document.querySelectorAll(sel).forEach(function(el) {
-                const u = el.getAttribute('href') || el.getAttribute('data-link');
-                if (u) urls.push(u);
-            });
-            return urls;
+        js_items: list = driver.execute_script(
+            f"""
+            const results = [];
+            const attrs = ['href', 'data-link', 'data-url', 'data-href', 'data-download'];
+            document.querySelectorAll('*').forEach(function(el) {{
+                attrs.forEach(function(attr) {{
+                    const u = el.getAttribute(attr);
+                    if (u && u.indexOf('gofile.io') !== -1) {{
+                        results.push([u, el.textContent.trim().slice(0, {_MAX_ELEMENT_TEXT_LEN})]);
+                    }}
+                }});
+            }});
+            return results;
             """
         ) or []
-        for href in js_urls:
-            if isinstance(href, str):
-                _add(href)
+        for item in js_items:
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                _add(str(item[0]), str(item[1]) if item[1] else "")
     except Exception as exc:
-        logger.debug("JavaScript link extraction failed: %s", exc)
+        logger.debug("JavaScript broad-attribute scan failed: %s", exc)
+
+    # Pass 3 – React fiber state extraction.
+    #
+    # gofile.io is a React SPA.  After the folder page loads, the SPA fetches
+    # the folder contents from api.gofile.io and stores the response in React
+    # component state.  We walk the React fiber tree looking for the standard
+    # gofile.io contents object ``{type: "file", name: ..., link: ...}``.
+    # This is the most reliable path for multi-file folders where the individual
+    # download links are not injected as plain anchor tags.
+    if not files:
+        try:
+            react_files: list = driver.execute_script(
+                f"""
+                try {{
+                    function findContents(fiber, depth) {{
+                        if (!fiber || depth > {_MAX_FIBER_DEPTH}) return null;
+                        for (var s = fiber.memoizedState; s; s = s.next) {{
+                            var v = s.memoizedState;
+                            if (v && typeof v === 'object' && !Array.isArray(v)) {{
+                                var contents = null;
+                                if (v.contents && typeof v.contents === 'object')
+                                    contents = v.contents;
+                                else if (v.data && v.data.contents)
+                                    contents = v.data.contents;
+                                else if (v.status === 'ok' && v.data && v.data.contents)
+                                    contents = v.data.contents;
+                                if (contents) {{
+                                    var items = Object.values(contents).filter(function(i) {{
+                                        return i && i.type === 'file' && (i.link || i.directLink);
+                                    }});
+                                    if (items.length > 0) return items.map(function(i) {{
+                                        return {{
+                                            name: i.name || '',
+                                            url: i.link || i.directLink || '',
+                                            size: i.size || null,
+                                            md5: i.md5 || null
+                                        }};
+                                    }});
+                                }}
+                            }}
+                        }}
+                        return findContents(fiber.child, depth + 1)
+                            || findContents(fiber.sibling, depth + 1);
+                    }}
+                    var root = document.getElementById('root') || document.body;
+                    var key = Object.keys(root).find(function(k) {{
+                        return k.indexOf('__reactFiber') === 0
+                            || k.indexOf('__reactInternalInstance') === 0;
+                    }});
+                    if (key) return findContents(root[key], 0);
+                }} catch(e) {{}}
+                return null;
+                """
+            )
+            if react_files and isinstance(react_files, list):
+                logger.info(
+                    "React fiber extracted %d file(s) from folder state.", len(react_files)
+                )
+                for item in react_files:
+                    if not isinstance(item, dict):
+                        continue
+                    item_url = item.get("url", "")
+                    item_name = item.get("name", "")
+                    if item_url and not _is_thumbnail(item_name):
+                        if item_url not in seen:
+                            seen.add(item_url)
+                            files.append(
+                                {
+                                    "name": item_name,
+                                    "url": item_url,
+                                    "size": item.get("size"),
+                                    "md5": item.get("md5"),
+                                }
+                            )
+        except Exception as exc:
+            logger.debug("React fiber extraction failed: %s", exc)
 
     if files:
         return files
 
-    # Pass 3 – regex-scan the raw page source as a final fallback.
+    # Pass 4 – regex-scan the raw page source as a last-resort fallback.
     try:
         for raw_url in GOFILE_DOWNLOAD_RE.findall(driver.page_source):
             _add(raw_url.rstrip("\"'\\"))
@@ -432,22 +295,12 @@ def scrape_folder(folder_url: str) -> "list[dict]":
 
     _ensure_auth()
 
-    match = GOFILE_FOLDER_RE.search(folder_url)
-    folder_id = match.group(1) if match else None
-
     # -----------------------------------------------------------------------
-    # Step 1 – Load the folder page in the authenticated browser.
-    #
-    # This serves two purposes:
-    #   a) The gofile.io SPA makes its own API call (with the live wt= token)
-    #      which we capture via performance.getEntriesByType('resource').
-    #      _refresh_website_token() is called inside _scrape_via_dom() after
-    #      the page renders, so the token cache is up-to-date before Step 2.
-    #   b) The DOM-scraped results are used as a fallback if the API path fails.
+    # Step 1 – Load the folder page in the authenticated browser and scrape.
     # -----------------------------------------------------------------------
-    dom_files: list[dict] = []
+    files: list[dict] = []
     try:
-        dom_files = _scrape_via_dom(folder_url)
+        files = _scrape_via_dom(folder_url)
     except WebDriverException as exc:
         logger.error("WebDriver error during DOM scrape: %s", exc)
         try:
@@ -459,46 +312,30 @@ def scrape_folder(folder_url: str) -> "list[dict]":
         _authenticated = False
         raise
 
-    # -----------------------------------------------------------------------
-    # Step 2 – REST API call (now has a fresh website token from Step 1).
-    # -----------------------------------------------------------------------
-    if folder_id:
-        api_files = _scrape_via_api(folder_id)
-        if api_files:
-            return api_files
+    if files:
+        return files
 
     # -----------------------------------------------------------------------
-    # Step 3 – Fall back to DOM results.
+    # Step 2 – Nothing found; session may have expired.
+    #           Re-authenticate once and retry DOM scraping.
     # -----------------------------------------------------------------------
-    if dom_files:
-        return dom_files
-
-    # -----------------------------------------------------------------------
-    # Step 4 – Nothing found at all; session may have expired.
-    #           Re-authenticate once and retry the full sequence.
-    # -----------------------------------------------------------------------
-    if folder_id:
-        logger.info("No files found; re-authenticating and retrying…")
-        _authenticated = False
-        _login()
+    logger.info("No files found; re-authenticating and retrying…")
+    _authenticated = False
+    _login()
+    try:
+        files = _scrape_via_dom(folder_url)
+    except WebDriverException as exc:
+        logger.error("WebDriver error during retry DOM scrape: %s", exc)
         try:
-            dom_files = _scrape_via_dom(folder_url)
-        except WebDriverException as exc:
-            logger.error("WebDriver error during retry DOM scrape: %s", exc)
-            try:
-                if _driver:
-                    _driver.quit()
-            except Exception:
-                pass
-            _driver = None
-            _authenticated = False
-            raise
-        api_files = _scrape_via_api(folder_id)
-        if api_files:
-            return api_files
-        return dom_files
+            if _driver:
+                _driver.quit()
+        except Exception:
+            pass
+        _driver = None
+        _authenticated = False
+        raise
 
-    return dom_files
+    return files
 
 
 # ---------------------------------------------------------------------------
