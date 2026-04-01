@@ -175,16 +175,54 @@ def _get_account_token() -> "str | None":
 
 
 def _refresh_website_token() -> None:
-    """Try to extract the live gofile.io website token from the current browser page.
+    """Fetch the live gofile.io website token and cache it.
 
     gofile.io's website token (``wt``) rotates roughly every 4 hours and is
-    unique per account.  The most reliable source is the browser's performance
-    resource-timing API: after any gofile.io folder page loads, the SPA has
-    already made its own API call containing ``wt=<token>`` in the URL.  We
-    read it back from ``performance.getEntriesByType('resource')``.
+    unique per account.  We try four methods in order of reliability:
+
+    0. **Direct API call** to ``/accounts/getid`` – the same public endpoint
+       that the gofile.io SPA calls on startup to obtain the rotating guest /
+       website token.  No browser required; this is the authoritative source.
+    1. **Performance resource entries** – if the SPA already ran in the browser
+       and made an API call with ``wt=`` as a query parameter we can read it
+       back from ``performance.getEntriesByType('resource')``.
+    2. **Window properties** – ``window._wt``, ``window.wt``, etc.
+    3. **Page-source regex** – scan the rendered HTML for ``"wt":"<token>"``.
     """
     global _cached_wt, _wt_fetched_at
-    driver = _get_driver()
+
+    # ------------------------------------------------------------------
+    # Method 0 (primary): call /accounts/getid directly.
+    # gofile.io's SPA calls this on every page load to get the current wt.
+    # The returned "id" field IS the website token.
+    # ------------------------------------------------------------------
+    try:
+        resp = requests.get(
+            "https://api.gofile.io/accounts/getid",
+            timeout=10,
+        )
+        resp.raise_for_status()
+        body = resp.json()
+        if body.get("status") == "ok":
+            guest_id: str = body.get("data", {}).get("id", "")
+            if guest_id:
+                _cached_wt = guest_id
+                _wt_fetched_at = time.time()
+                logger.info(
+                    "Website token refreshed via /accounts/getid: %s…", guest_id[:6]
+                )
+                return
+    except Exception as exc:
+        logger.debug("/accounts/getid call failed: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Methods 1–3: browser-based fallbacks (require an active page load).
+    # ------------------------------------------------------------------
+    try:
+        driver = _get_driver()
+    except Exception as exc:
+        logger.debug("Could not get driver for browser-based wt extraction: %s", exc)
+        return
 
     # Method 1: performance resource entries – the SPA's own API calls embed wt=.
     # We scan from newest to oldest so we get the most recent token.
@@ -240,7 +278,7 @@ def _refresh_website_token() -> None:
     except Exception as exc:
         logger.debug("Page-source wt scan failed: %s", exc)
 
-    logger.debug("Could not extract website token from browser page.")
+    logger.warning("Could not refresh website token – all methods failed.")
 
 
 def _get_website_token() -> str:
@@ -273,10 +311,15 @@ def _scrape_via_api(folder_id: str) -> "list[dict]":
         return []
 
     wt = _get_website_token()
+    if not wt:
+        logger.warning("No website token available; skipping API scrape.")
+        return []
+
     session = _build_requests_session()
 
     url = f"https://api.gofile.io/contents/{folder_id}"
     params: dict = {"token": token, "wt": wt}
+    logger.info("Calling API: %s (wt=%s…)", url, wt[:6] if len(wt) >= 6 else wt)
 
     try:
         resp = session.get(url, params=params, timeout=_API_REQUEST_TIMEOUT)
@@ -287,10 +330,13 @@ def _scrape_via_api(folder_id: str) -> "list[dict]":
         return []
 
     if body.get("status") != "ok":
-        logger.warning("API returned status=%s", body.get("status"))
+        logger.warning(
+            "API returned status=%s (message=%s)", body.get("status"), body.get("message", "")
+        )
         return []
 
     contents = body.get("data", {}).get("contents") or {}
+    logger.info("API returned %d item(s) in contents.", len(contents))
     files: list[dict] = []
     for item in contents.values():
         if item.get("type") != "file":
